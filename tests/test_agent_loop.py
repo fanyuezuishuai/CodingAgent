@@ -1,0 +1,204 @@
+"""Offline end-to-end tests for the autonomous loop."""
+
+import json
+import sys
+from pathlib import Path
+
+from tests.fakes import FakeModelClient
+from tracecoder.agent import Agent
+from tracecoder.context import ContextManager
+from tracecoder.domain import ModelReply, TerminationReason, ToolCall, VerificationStatus
+from tracecoder.tools import build_tool_registry
+from tracecoder.trace import TraceRecorder, read_trace
+
+
+def _agent(tmp_path: Path, replies: list[ModelReply], *, repeat_limit: int = 3, max_steps: int = 10) -> tuple[Agent, FakeModelClient, TraceRecorder]:
+    model = FakeModelClient(replies)
+    trace = TraceRecorder(tmp_path, secrets=["sentinel-secret"], session_id="agent-test")
+    registry = build_tool_registry(tmp_path, lambda _argv, _cwd: True)
+    agent = Agent(
+        model,
+        registry,
+        ContextManager(max_chars=10_000),
+        trace,
+        max_steps=max_steps,
+        repeat_limit=repeat_limit,
+    )
+    return agent, model, trace
+
+
+def test_fake_model_can_edit_verify_and_complete(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    replies = [
+        ModelReply(tool_calls=(ToolCall("read", "read_file", {"path": "app.py"}),)),
+        ModelReply(
+            tool_calls=(
+                ToolCall(
+                    "write",
+                    "replace_text",
+                    {"path": "app.py", "old": "1", "new": "2"},
+                ),
+            )
+        ),
+        ModelReply(
+            tool_calls=(
+                ToolCall(
+                    "verify",
+                    "run_command",
+                    {
+                        "argv": [sys.executable, "-c", "from pathlib import Path; assert '2' in Path('app.py').read_text()"],
+                        "purpose": "verify",
+                    },
+                ),
+            )
+        ),
+        ModelReply(content="Updated app.py and verified the result."),
+    ]
+    agent, model, trace = _agent(tmp_path, replies)
+
+    result = agent.run("Change the value to 2")
+
+    assert result.termination_reason is TerminationReason.COMPLETED
+    assert result.verification_status is VerificationStatus.VERIFIED
+    assert result.changed_files == ("app.py",)
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "value = 2\n"
+    assert any(message.get("tool_call_id") == "verify" for message in model.requests[-1])
+    events = read_trace(trace.path)
+    assert events[-1]["event_type"] == "run_finished"
+    assert events[-1]["payload"]["reason"] == "completed"
+
+
+def test_unverified_mutation_gets_one_reminder_then_finishes(tmp_path: Path) -> None:
+    (tmp_path / "note.txt").write_text("old", encoding="utf-8")
+    replies = [
+        ModelReply(tool_calls=(ToolCall("write", "write_file", {"path": "note.txt", "content": "new"}),)),
+        ModelReply(content="Done."),
+        ModelReply(content="I cannot run verification."),
+    ]
+    agent, model, _trace = _agent(tmp_path, replies)
+
+    result = agent.run("Update the note")
+
+    assert result.termination_reason is TerminationReason.COMPLETED
+    assert result.verification_status is VerificationStatus.REQUIRED
+    assert len(model.requests) == 3
+    assert any("verification" in str(message.get("content", "")).lower() for message in model.requests[-1])
+
+
+def test_repeated_identical_calls_stop_deterministically(tmp_path: Path) -> None:
+    repeated = [
+        ModelReply(tool_calls=(ToolCall(f"call-{index}", "list_files", {"path": "."}),))
+        for index in range(3)
+    ]
+    agent, _model, _trace = _agent(tmp_path, repeated, repeat_limit=3)
+
+    result = agent.run("Loop forever")
+
+    assert result.termination_reason is TerminationReason.REPEATED_CALL
+    assert result.steps == 3
+
+
+def test_max_steps_stops_non_finishing_model(tmp_path: Path) -> None:
+    replies = [ModelReply(tool_calls=(ToolCall("call", "list_files", {}),))]
+    agent, _model, _trace = _agent(tmp_path, replies, max_steps=1)
+
+    result = agent.run("Keep working")
+
+    assert result.termination_reason is TerminationReason.MAX_STEPS
+
+
+def test_multiple_tool_results_remain_paired_with_ids(tmp_path: Path) -> None:
+    (tmp_path / "one.txt").write_text("one", encoding="utf-8")
+    replies = [
+        ModelReply(
+            tool_calls=(
+                ToolCall("one", "read_file", {"path": "one.txt"}),
+                ToolCall("missing", "read_file", {"path": "missing.txt"}),
+            )
+        ),
+        ModelReply(content="Inspected both files."),
+    ]
+    agent, model, _trace = _agent(tmp_path, replies)
+
+    agent.run("Inspect files")
+
+    tool_messages = [message for message in model.requests[-1] if message.get("role") == "tool"]
+    assert [message["tool_call_id"] for message in tool_messages] == ["one", "missing"]
+    assert json.loads(str(tool_messages[1]["content"]))["error_code"] == "path_not_found"
+
+
+def test_secret_is_redacted_before_tool_result_reaches_model(tmp_path: Path) -> None:
+    (tmp_path / "secret.txt").write_text("sentinel-secret", encoding="utf-8")
+    replies = [
+        ModelReply(tool_calls=(ToolCall("read", "read_file", {"path": "secret.txt"}),)),
+        ModelReply(content="Read it."),
+    ]
+    agent, model, trace = _agent(tmp_path, replies)
+
+    agent.run("Read the file")
+
+    assert "sentinel-secret" not in json.dumps(model.requests[-1])
+    assert "sentinel-secret" not in trace.path.read_text(encoding="utf-8")
+
+
+def test_later_mutation_invalidates_prior_verification(tmp_path: Path) -> None:
+    (tmp_path / "value.txt").write_text("one", encoding="utf-8")
+    replies = [
+        ModelReply(tool_calls=(ToolCall("write-1", "write_file", {"path": "value.txt", "content": "two"}),)),
+        ModelReply(
+            tool_calls=(
+                ToolCall(
+                    "verify",
+                    "run_command",
+                    {"argv": [sys.executable, "-c", "raise SystemExit(0)"], "purpose": "verify"},
+                ),
+            )
+        ),
+        ModelReply(tool_calls=(ToolCall("write-2", "write_file", {"path": "value.txt", "content": "three"}),)),
+        ModelReply(content="Done."),
+        ModelReply(content="No further verification available."),
+    ]
+    agent, _model, _trace = _agent(tmp_path, replies)
+
+    result = agent.run("Change the value twice")
+
+    assert result.verification_status is VerificationStatus.REQUIRED
+
+
+class RaisingModelClient:
+    """Raise one configured failure from the model boundary."""
+
+    def __init__(self, failure: BaseException) -> None:
+        self.failure = failure
+
+    def complete(self, messages: list[dict[str, object]], tools: list[dict[str, object]]) -> ModelReply:
+        raise self.failure
+
+
+def test_provider_error_becomes_terminal_result(tmp_path: Path) -> None:
+    trace = TraceRecorder(tmp_path, session_id="provider-error")
+    agent = Agent(
+        RaisingModelClient(RuntimeError("provider unavailable")),
+        build_tool_registry(tmp_path, lambda _argv, _cwd: True),
+        ContextManager(),
+        trace,
+    )
+
+    result = agent.run("Inspect the project")
+
+    assert result.termination_reason is TerminationReason.PROVIDER_ERROR
+    assert read_trace(trace.path)[-1]["payload"]["reason"] == "provider_error"
+
+
+def test_keyboard_interrupt_becomes_interrupted_result(tmp_path: Path) -> None:
+    trace = TraceRecorder(tmp_path, session_id="interrupted")
+    agent = Agent(
+        RaisingModelClient(KeyboardInterrupt()),
+        build_tool_registry(tmp_path, lambda _argv, _cwd: True),
+        ContextManager(),
+        trace,
+    )
+
+    result = agent.run("Inspect the project")
+
+    assert result.termination_reason is TerminationReason.INTERRUPTED
