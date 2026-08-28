@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 
 from tracecoder.context import ContextManager
 from tracecoder.domain import (
@@ -42,6 +43,7 @@ class Agent:
         *,
         max_steps: int = 20,
         repeat_limit: int = 3,
+        cancelled: Callable[[], bool] | None = None,
     ) -> None:
         if max_steps <= 0 or repeat_limit <= 0:
             raise ValueError("max_steps and repeat_limit must be positive")
@@ -51,6 +53,7 @@ class Agent:
         self.trace = trace
         self.max_steps = max_steps
         self.repeat_limit = repeat_limit
+        self.cancelled = cancelled or (lambda: False)
 
     def run(self, task: str) -> RunResult:
         """Run one task until a deterministic terminal condition is reached."""
@@ -73,6 +76,13 @@ class Agent:
 
         try:
             for steps in range(1, self.max_steps + 1):
+                if self.cancelled():
+                    return self._finish_interrupted(
+                        verification,
+                        changed_files,
+                        steps - 1,
+                        shell_side_effects_unknown,
+                    )
                 runtime_summary = _runtime_summary(changed_files, verification, shell_side_effects_unknown, failures)
                 request_messages = self.context.prepare(messages, runtime_summary)
                 model_started = time.monotonic()
@@ -87,6 +97,13 @@ class Agent:
                         "elapsed_seconds": model_elapsed,
                     },
                 )
+                if self.cancelled():
+                    return self._finish_interrupted(
+                        verification,
+                        changed_files,
+                        steps,
+                        shell_side_effects_unknown,
+                    )
                 messages.append(_assistant_message(reply))
 
                 if not reply.tool_calls:
@@ -105,6 +122,13 @@ class Agent:
                     )
 
                 for call in reply.tool_calls:
+                    if self.cancelled():
+                        return self._finish_interrupted(
+                            verification,
+                            changed_files,
+                            steps,
+                            shell_side_effects_unknown,
+                        )
                     fingerprint = _tool_fingerprint(call)
                     if fingerprint == last_fingerprint:
                         repeat_count += 1
@@ -163,9 +187,7 @@ class Agent:
                 shell_side_effects_unknown,
             )
         except KeyboardInterrupt:
-            return self._finish(
-                "Interrupted by the user.",
-                TerminationReason.INTERRUPTED,
+            return self._finish_interrupted(
                 verification,
                 changed_files,
                 steps,
@@ -181,6 +203,22 @@ class Agent:
                 steps,
                 shell_side_effects_unknown,
             )
+
+    def _finish_interrupted(
+        self,
+        verification: VerificationStatus,
+        changed_files: list[str],
+        steps: int,
+        shell_side_effects_unknown: bool,
+    ) -> RunResult:
+        return self._finish(
+            "Interrupted by the user.",
+            TerminationReason.INTERRUPTED,
+            verification,
+            changed_files,
+            steps,
+            shell_side_effects_unknown,
+        )
 
     def _finish(
         self,

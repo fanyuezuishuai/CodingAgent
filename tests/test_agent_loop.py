@@ -202,3 +202,89 @@ def test_keyboard_interrupt_becomes_interrupted_result(tmp_path: Path) -> None:
     result = agent.run("Inspect the project")
 
     assert result.termination_reason is TerminationReason.INTERRUPTED
+
+
+def test_cancel_request_stops_before_calling_the_model(tmp_path: Path) -> None:
+    model = FakeModelClient([ModelReply(content="should not be returned")])
+    trace = TraceRecorder(tmp_path, session_id="cancelled")
+    agent = Agent(
+        model,
+        build_tool_registry(tmp_path, lambda _argv, _cwd: True),
+        ContextManager(),
+        trace,
+        cancelled=lambda: True,
+    )
+
+    result = agent.run("Inspect the project")
+
+    assert result.termination_reason is TerminationReason.INTERRUPTED
+    assert model.requests == []
+    assert read_trace(trace.path)[-1]["payload"]["reason"] == "interrupted"
+
+
+def test_cancel_request_after_model_reply_skips_requested_tool(tmp_path: Path) -> None:
+    model = FakeModelClient(
+        [ModelReply(tool_calls=(ToolCall("should-not-run", "list_files", {"path": "."}),))]
+    )
+    trace = TraceRecorder(tmp_path, session_id="cancel-after-model")
+    agent = Agent(
+        model,
+        build_tool_registry(tmp_path, lambda _argv, _cwd: True),
+        ContextManager(),
+        trace,
+        cancelled=lambda: bool(model.requests),
+    )
+
+    result = agent.run("Inspect the project")
+
+    assert result.termination_reason is TerminationReason.INTERRUPTED
+    assert result.steps == 1
+    assert len(model.requests) == 1
+    events = read_trace(trace.path)
+    assert [event["event_type"] for event in events] == ["run_started", "model_reply", "run_finished"]
+    assert events[-1]["payload"]["reason"] == "interrupted"
+
+
+def test_cancel_request_between_tool_calls_skips_later_tool_and_model(tmp_path: Path) -> None:
+    cancelled = False
+
+    def observe(event: dict[str, object]) -> None:
+        nonlocal cancelled
+        if event["event_type"] == "tool_result":
+            cancelled = True
+
+    model = FakeModelClient(
+        [
+            ModelReply(
+                tool_calls=(
+                    ToolCall("first", "list_files", {"path": "."}),
+                    ToolCall("second", "list_files", {"path": "."}),
+                )
+            ),
+            ModelReply(content="This reply must not be requested."),
+        ]
+    )
+    trace = TraceRecorder(tmp_path, session_id="cancel-between-tools", observer=observe)
+    agent = Agent(
+        model,
+        build_tool_registry(tmp_path, lambda _argv, _cwd: True),
+        ContextManager(),
+        trace,
+        cancelled=lambda: cancelled,
+    )
+
+    result = agent.run("Inspect the project")
+
+    assert result.termination_reason is TerminationReason.INTERRUPTED
+    assert result.steps == 1
+    assert len(model.requests) == 1
+    events = read_trace(trace.path)
+    assert [event["event_type"] for event in events] == [
+        "run_started",
+        "model_reply",
+        "tool_requested",
+        "tool_result",
+        "run_finished",
+    ]
+    assert events[2]["payload"]["tool_call_id"] == "first"
+    assert events[-1]["payload"]["reason"] == "interrupted"

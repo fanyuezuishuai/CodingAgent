@@ -13,7 +13,7 @@ from tracecoder.domain import JSONValue, ToolResult
 MAX_FILE_BYTES = 1_000_000
 DEFAULT_MAX_ENTRIES = 200
 DEFAULT_MAX_RESULTS = 100
-RESERVED_TOP_LEVEL = {".git", ".tracecoder"}
+RESERVED_TOP_LEVEL = {".env", ".git", ".tracecoder"}
 
 
 class WorkspacePathError(ValueError):

@@ -11,6 +11,8 @@ from tracecoder.tools.filesystem import WorkspaceFileTools, WorkspacePolicy
 def tools(tmp_path: Path) -> WorkspaceFileTools:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "sample.py").write_text("alpha\nbeta alpha\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("TRACECODER_API_KEY=dotenv-secret\n", encoding="utf-8")
+    (tmp_path / ".env.example").write_text("TRACECODER_API_KEY=replace-me\n", encoding="utf-8")
     (tmp_path / ".tracecoder").mkdir()
     (tmp_path / ".tracecoder" / "private.jsonl").write_text("secret", encoding="utf-8")
     return WorkspaceFileTools(WorkspacePolicy(tmp_path))
@@ -30,6 +32,27 @@ def test_reserved_runtime_directory_is_hidden(tools: WorkspaceFileTools) -> None
 
     assert read_result.error_code == "reserved_path"
     assert all(".tracecoder" not in str(item) for item in list_result.data["entries"])
+
+
+def test_workspace_dotenv_is_reserved_but_example_remains_readable(tools: WorkspaceFileTools) -> None:
+    direct_results = [
+        tools.read_file(".env"),
+        tools.write_file(".env", "TRACECODER_API_KEY=replaced\n"),
+        tools.replace_text(".env", "dotenv-secret", "replaced-secret"),
+        tools.search_text("dotenv-secret", ".env"),
+        tools.list_files(".env"),
+    ]
+    flat_list = tools.list_files(".")
+    recursive_list = tools.list_files(".", recursive=True)
+    search_result = tools.search_text("dotenv-secret")
+
+    assert all(result.error_code == "reserved_path" for result in direct_results)
+    assert tools.read_file(".env.example").ok
+    assert ".env.example" in [entry["path"] for entry in flat_list.data["entries"]]
+    assert ".env" not in [entry["path"] for entry in flat_list.data["entries"]]
+    assert ".env" not in [entry["path"] for entry in recursive_list.data["entries"]]
+    assert search_result.ok
+    assert search_result.data["matches"] == []
 
 
 def test_read_search_write_and_replace(tools: WorkspaceFileTools, tmp_path: Path) -> None:

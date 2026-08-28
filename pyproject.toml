@@ -9,11 +9,16 @@ description = "A small, traceable local coding agent built without an agent fram
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "fastapi>=0.141,<1",
   "openai>=1.0,<3",
+  "python-dotenv>=1.2,<2",
+  "uvicorn>=0.52,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
+  "build>=1.3,<2",
+  "httpx>=0.28,<1",
   "mypy>=1.11",
   "pytest>=8.0",
   "ruff>=0.6",
@@ -24,6 +29,9 @@ tracecoder = "tracecoder.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+tracecoder = ["py.typed", "web_static/*.css", "web_static/*.html", "web_static/*.js"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]
@@ -41,4 +49,3 @@ ignore = ["E501"]
 python_version = "3.11"
 strict = true
 packages = ["tracecoder"]
-

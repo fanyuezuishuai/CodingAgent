@@ -6,15 +6,13 @@ import argparse
 import json
 import sys
 from collections.abc import Callable, Sequence
+from ipaddress import ip_address
 from pathlib import Path
 
-from tracecoder.agent import Agent
 from tracecoder.config import ConfigError, Settings
-from tracecoder.context import ContextManager
 from tracecoder.domain import TerminationReason
-from tracecoder.llm.openai_compatible import OpenAICompatibleClient
-from tracecoder.tools import build_tool_registry
-from tracecoder.trace import TraceFormatError, TraceRecorder, read_trace
+from tracecoder.runtime import build_agent
+from tracecoder.trace import TraceFormatError, read_trace
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,6 +33,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     trace_parser = subparsers.add_parser("trace", help="Pretty-print a JSONL run trace")
     trace_parser.add_argument("path", type=Path, help="Path to a trace JSONL file")
+
+    web_parser = subparsers.add_parser("web", help="Start the local browser interface")
+    web_parser.add_argument("--workspace", type=Path, default=Path.cwd(), help="Workspace directory (default: cwd)")
+    web_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind address (default: loopback only; non-loopback requires --trust-proxy-auth)",
+    )
+    web_parser.add_argument("--port", type=_tcp_port, default=8765, help="TCP port (default: 8765)")
+    web_parser.add_argument(
+        "--trust-proxy-auth",
+        action="store_true",
+        help="Acknowledge an authenticated reverse proxy protects a non-loopback bind (for example, a private forwarded port)",
+    )
     return parser
 
 
@@ -64,6 +76,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "trace":
         return _show_trace(args.path)
+    if args.command == "web":
+        return _run_web(args)
     return _run_task(args)
 
 
@@ -81,7 +95,7 @@ def _run_task(args: argparse.Namespace) -> int:
         print(f"error: workspace is not a directory: {workspace}", file=sys.stderr)
         return 2
     try:
-        settings = Settings.from_env()
+        settings = Settings.from_env(env_file=workspace / ".env")
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 2
@@ -97,19 +111,10 @@ def _run_task(args: argparse.Namespace) -> int:
     else:
         print("Command mode: interactive approval of exact argv and cwd.")
 
-    trace = TraceRecorder(workspace, secrets=[settings.api_key])
-    registry = build_tool_registry(
+    agent = build_agent(
         workspace,
+        settings,
         make_approval(args.yes),
-        default_timeout_seconds=settings.command_timeout_seconds,
-        max_output_bytes=settings.command_output_bytes,
-    )
-    model = OpenAICompatibleClient(settings.api_key, settings.base_url, settings.model)
-    agent = Agent(
-        model,
-        registry,
-        ContextManager(settings.context_max_chars),
-        trace,
         max_steps=max_steps,
         repeat_limit=repeat_limit,
     )
@@ -126,6 +131,49 @@ def _run_task(args: argparse.Namespace) -> int:
     if result.termination_reason is TerminationReason.INTERRUPTED:
         return 130
     return 0 if result.successful else 1
+
+
+def _run_web(args: argparse.Namespace) -> int:
+    if not _is_loopback_host(args.host) and not args.trust_proxy_auth:
+        print(
+            "error: refusing non-loopback web binding without --trust-proxy-auth; "
+            "use it only behind an authenticated reverse proxy (for example, a private forwarded port).",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        workspace = args.workspace.resolve(strict=True)
+    except FileNotFoundError:
+        print(f"error: workspace does not exist: {args.workspace}", file=sys.stderr)
+        return 2
+    if not workspace.is_dir():
+        print(f"error: workspace is not a directory: {workspace}", file=sys.stderr)
+        return 2
+    try:
+        settings = Settings.from_env(env_file=workspace / ".env")
+    except ConfigError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"Provider:  {settings.base_url}")
+    print(f"Model:     {settings.model}")
+    print(f"Workspace: {workspace}")
+    print(f"Web UI:    http://{args.host}:{args.port}")
+    print("Data notice: prompts, requested source text, and command output are sent to this provider.")
+    if not _is_loopback_host(args.host):
+        print("Security acknowledgement: non-loopback binding relies on your authenticated reverse proxy.")
+    start_web_server(workspace, settings, args.host, args.port)
+    return 0
+
+
+def start_web_server(workspace: Path, settings: Settings, host: str, port: int) -> None:
+    """Start the blocking ASGI server; kept separate for boundary tests."""
+
+    import uvicorn
+
+    from tracecoder.web import create_app
+
+    uvicorn.run(create_app(workspace, settings), host=host, port=port, log_level="info")
 
 
 def _show_trace(path: Path) -> int:
@@ -148,3 +196,24 @@ def _positive_cli_int(value: str) -> int:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return number
 
+
+def _tcp_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer between 1 and 65535") from exc
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("must be an integer between 1 and 65535")
+    return port
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Return whether a CLI host is localhost or an IP loopback address."""
+
+    normalized = host.strip()
+    if normalized.casefold() == "localhost":
+        return True
+    try:
+        return ip_address(normalized).is_loopback
+    except ValueError:
+        return False

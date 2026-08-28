@@ -1,7 +1,7 @@
 Git 仓库：https://github.com/fanyuezuishuai/CodingAgent
 
-运行：安装 Python 3.11+，创建虚拟环境后执行 `python -m pip install -e ".[dev]"`。设置环境变量 TRACECODER_API_KEY、TRACECODER_BASE_URL、TRACECODER_MODEL，再执行 `tracecoder run "编程任务" --workspace 项目目录`。测试命令为 `python -m pytest -q`。
+运行：安装 Python 3.11+，创建虚拟环境并执行 `python -m pip install -e ".[dev]"`。在工作区 `.env` 中配置 TRACECODER_API_KEY、TRACECODER_BASE_URL、TRACECODER_MODEL；系统环境变量优先。CLI：`tracecoder run "编程任务" --workspace .`。GUI：`tracecoder web --workspace .`，浏览器访问 `http://127.0.0.1:8765`。Codespaces 配置个人 Secrets 后运行 `tracecoder web --workspace . --host 0.0.0.0 --trust-proxy-auth`。
 
-特色：项目未使用任何 Agent 框架。自行实现 OpenAI-compatible tool calling 解析、对话历史与确定性上下文压缩、六个本地工具、参数校验、有界 Agent 循环、重复调用/最大步数终止、命令审批与超时、工作区路径隔离、验证状态以及脱敏 JSONL 轨迹。自动化测试使用假模型，不需要真实 API key。
+特色：未使用 Agent 框架。自行实现 tool calling 解析、对话历史与确定性上下文压缩、六个本地工具、参数校验、有界循环、重复调用/最大步数终止、命令审批与超时、工作区路径隔离、验证状态及脱敏 JSONL 轨迹。Web GUI 实时展示模型/工具事件，支持命令审批、停止、改动与验证证据；同一工作区禁止并发任务。GitHub Actions 在 Windows/Linux 自动测试。
 
-安全说明：凭据仅从环境变量读取，仓库不含 key。文件工具不能越出工作区，也不能访问内部轨迹目录；命令默认逐次确认，但并非操作系统沙箱。源码和命令输出会发送到所配置的模型提供方。
+安全说明：`.env` 已忽略且对模型文件工具保留，仓库不含 key。文件工具不能越出工作区或访问内部轨迹；命令默认逐次确认，但并非操作系统沙箱。源码和命令输出会发送到所配置的模型提供方。`--trust-proxy-auth` 本身不提供认证，Codespaces 端口须保持 Private。

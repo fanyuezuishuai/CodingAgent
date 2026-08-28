@@ -1,0 +1,23 @@
+{
+  "name": "TraceCoder",
+  "image": "mcr.microsoft.com/devcontainers/python:3.13-bookworm",
+  "postCreateCommand": "python -m pip install -e \".[dev]\"",
+  "forwardPorts": [8765],
+  "portsAttributes": {
+    "8765": {
+      "label": "TraceCoder Web",
+      "onAutoForward": "openBrowser"
+    }
+  },
+  "secrets": {
+    "TRACECODER_API_KEY": {
+      "description": "Your personal API key for the configured model provider. Never commit it to the repository."
+    },
+    "TRACECODER_BASE_URL": {
+      "description": "OpenAI-compatible API base URL, for example https://api.deepseek.com."
+    },
+    "TRACECODER_MODEL": {
+      "description": "A tool-calling model identifier supported by your provider."
+    }
+  }
+}

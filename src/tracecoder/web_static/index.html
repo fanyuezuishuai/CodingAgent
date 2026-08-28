@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>TraceCoder</title>
+    <link rel="stylesheet" href="/assets/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="TraceCoder 首页">
+        <span class="brand-mark">T</span>
+        <span><strong>TraceCoder</strong><small>local coding agent</small></span>
+      </a>
+      <div class="runtime-pill"><span class="status-dot"></span><span id="runtime-label">正在连接本地运行时</span></div>
+    </header>
+
+    <main class="shell">
+      <aside class="context-panel panel">
+        <p class="eyebrow">运行环境</p>
+        <dl class="runtime-details">
+          <div><dt>工作区</dt><dd id="workspace">—</dd></div>
+          <div><dt>模型</dt><dd id="model">—</dd></div>
+          <div><dt>提供方</dt><dd id="provider">—</dd></div>
+        </dl>
+        <div class="notice">
+          <strong>本地执行</strong>
+          <p>文件与命令工具在当前工作区运行。模型请求仍会发送给上方提供方。</p>
+        </div>
+        <div class="run-evidence" id="evidence" hidden>
+          <p class="eyebrow">运行证据</p>
+          <dl class="runtime-details" id="evidence-details"></dl>
+        </div>
+      </aside>
+
+      <section class="chat-panel panel">
+        <div class="chat-header">
+          <div><p class="eyebrow">智能体会话</p><h1>把编程任务交给 TraceCoder</h1></div>
+          <button class="ghost-button" id="cancel-button" type="button" disabled>停止运行</button>
+        </div>
+
+        <div class="timeline" id="timeline" aria-live="polite">
+          <div class="empty-state" id="empty-state">
+            <div class="empty-icon">⌁</div>
+            <h2>可观察、可审批、可追踪</h2>
+            <p>输入任务后，这里会按顺序展示模型回复、工具请求、执行结果与验证证据。</p>
+          </div>
+        </div>
+
+        <div class="approval-card" id="approval-card" hidden>
+          <div><span class="warning-badge">需要审批</span><strong>智能体请求执行命令</strong></div>
+          <p class="mono" id="approval-cwd"></p>
+          <pre id="approval-command"></pre>
+          <div class="approval-actions">
+            <button class="ghost-button" id="deny-button" type="button">拒绝</button>
+            <button class="primary-button" id="approve-button" type="button">允许执行</button>
+          </div>
+        </div>
+
+        <form class="composer" id="task-form">
+          <label class="sr-only" for="task-input">编程任务</label>
+          <textarea id="task-input" rows="3" maxlength="20000" placeholder="例如：阅读项目，修复失败测试并验证结果" required></textarea>
+          <div class="composer-footer">
+            <span>命令默认逐次审批</span>
+            <button class="primary-button" id="run-button" type="submit">运行任务 <span>↗</span></button>
+          </div>
+        </form>
+      </section>
+    </main>
+
+    <template id="event-template">
+      <article class="event-card">
+        <div class="event-meta"><span class="event-kind"></span><span class="event-index"></span></div>
+        <div class="event-content"></div>
+      </article>
+    </template>
+    <script src="/assets/app.js" defer></script>
+  </body>
+</html>
