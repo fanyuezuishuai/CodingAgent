@@ -68,6 +68,47 @@ def test_fake_model_can_edit_verify_and_complete(tmp_path: Path) -> None:
     assert events[-1]["payload"]["reason"] == "completed"
 
 
+def test_agent_carries_structured_conversation_messages_into_the_next_turn(tmp_path: Path) -> None:
+    first_agent, _first_model, _first_trace = _agent(tmp_path, [ModelReply(content="The chosen name is Alpha.")])
+    first_agent.run("Remember that the chosen name is Alpha.")
+
+    second_agent, second_model, _second_trace = _agent(tmp_path, [ModelReply(content="You chose Alpha.")])
+    second_agent.run("What name did I choose?", history=first_agent.conversation_messages)
+
+    request = second_model.requests[0]
+    assert [message["role"] for message in request] == ["system", "user", "assistant", "user"]
+    assert request[1]["content"] == "Remember that the chosen name is Alpha."
+    assert request[2]["content"] == "The chosen name is Alpha."
+    assert request[3]["content"] == "What name did I choose?"
+
+
+def test_agent_carries_complete_tool_bundles_into_the_next_turn(tmp_path: Path) -> None:
+    (tmp_path / "note.txt").write_text("remember me", encoding="utf-8")
+    first_agent, _first_model, _first_trace = _agent(
+        tmp_path,
+        [
+            ModelReply(tool_calls=(ToolCall("read-note", "read_file", {"path": "note.txt"}),)),
+            ModelReply(content="I read note.txt."),
+        ],
+    )
+    first_agent.run("Read note.txt.")
+
+    second_agent, second_model, _second_trace = _agent(tmp_path, [ModelReply(content="It said remember me.")])
+    second_agent.run("What did the file say?", history=first_agent.conversation_messages)
+
+    request = second_model.requests[0]
+    assert [message["role"] for message in request] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "user",
+    ]
+    assert request[3]["tool_call_id"] == "read-note"
+    assert "remember me" in str(request[3]["content"])
+
+
 def test_unverified_mutation_gets_one_reminder_then_finishes(tmp_path: Path) -> None:
     (tmp_path / "note.txt").write_text("old", encoding="utf-8")
     replies = [
@@ -243,6 +284,8 @@ def test_cancel_request_after_model_reply_skips_requested_tool(tmp_path: Path) -
     events = read_trace(trace.path)
     assert [event["event_type"] for event in events] == ["run_started", "model_reply", "run_finished"]
     assert events[-1]["payload"]["reason"] == "interrupted"
+    assert [message["role"] for message in agent.conversation_messages] == ["user", "assistant"]
+    assert all(not message.get("tool_calls") for message in agent.conversation_messages)
 
 
 def test_cancel_request_between_tool_calls_skips_later_tool_and_model(tmp_path: Path) -> None:
@@ -288,3 +331,5 @@ def test_cancel_request_between_tool_calls_skips_later_tool_and_model(tmp_path: 
     ]
     assert events[2]["payload"]["tool_call_id"] == "first"
     assert events[-1]["payload"]["reason"] == "interrupted"
+    assert [message["role"] for message in agent.conversation_messages] == ["user", "assistant"]
+    assert all(not message.get("tool_calls") for message in agent.conversation_messages)

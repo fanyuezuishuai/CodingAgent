@@ -6,6 +6,7 @@ from pathlib import Path
 from threading import Event
 from typing import Any, Protocol, cast
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tests.fakes import FakeModelClient
@@ -15,7 +16,7 @@ from tracecoder.context import ContextManager
 from tracecoder.domain import ModelReply, RunResult, TerminationReason, ToolCall, VerificationStatus
 from tracecoder.tools import build_tool_registry
 from tracecoder.trace import TraceRecorder, read_trace
-from tracecoder.web import RunManager, RunNotFoundError, create_app
+from tracecoder.web import RunManager, RunNotFoundError, _describe_command, create_app
 
 
 class RunnableAgent(Protocol):
@@ -53,6 +54,12 @@ def test_web_serves_ui_and_public_configuration(tmp_path: Path) -> None:
 
     assert page.status_code == 200
     assert "TraceCoder" in page.text
+    assert 'id="model"' in page.text
+    assert 'id="history-list"' in page.text
+    assert 'id="file-input"' in page.text
+    assert 'id="task-input"' in page.text
+    assert 'id="workspace"' not in page.text
+    assert 'id="provider"' not in page.text
     assert config.json() == {
         "workspace": str(tmp_path.resolve()),
         "provider": "https://provider.example/v1",
@@ -60,6 +67,317 @@ def test_web_serves_ui_and_public_configuration(tmp_path: Path) -> None:
     }
     assert "web-secret" not in page.text
     assert "web-secret" not in config.text
+
+
+def test_web_ui_assets_keep_process_collapsed_and_composer_docked(tmp_path: Path) -> None:
+    app = create_app(tmp_path, _settings())
+
+    with TestClient(app) as client:
+        page = client.get("/")
+        script = client.get("/assets/app.js")
+        markdown = client.get("/assets/markdown.js")
+        styles = client.get("/assets/styles.css")
+
+    assert '<details class="process-card">' in page.text
+    assert page.text.index('id="model"') < page.text.index('id="new-chat-button"') < page.text.index("历史对话")
+    assert 'class="new-chat-button"' in page.text
+    assert 'id="approval-description"' in page.text
+    assert "查看完整命令" in page.text
+    assert "renderFinalAnswer(runId, data.result, data.error)" in script.text
+    assert "renderProcessEvents(runId, data.events, data)" in script.text
+    assert "deferredProcessEvents" in script.text
+    assert 'request("/api/conversations")' in script.text
+    assert "TraceCoderMarkdown.render" in script.text
+    assert "/api/uploads?filename=" in script.text
+    assert markdown.status_code == 200
+    assert "escapeHtml" in markdown.text
+    assert "javascript:" in markdown.text
+    assert "grid-template-rows: auto minmax(0, 1fr) auto auto" in styles.text
+    assert ".composer-dock" in styles.text
+    assert ".empty-state[hidden]" in styles.text
+
+
+def test_web_lists_run_history_newest_first(tmp_path: Path) -> None:
+    class ImmediateAgent:
+        def run(self, task: str) -> RunResult:
+            return RunResult(
+                final_text=f"Finished {task}.",
+                termination_reason=TerminationReason.COMPLETED,
+                verification_status=VerificationStatus.NOT_REQUIRED,
+                changed_files=(),
+                trace_path=str(tmp_path / "trace.jsonl"),
+                steps=1,
+            )
+
+    def factory(
+        _approval: Callable[[list[str], Path], bool],
+        _observer: Callable[[dict[str, object]], None],
+        _cancelled: Callable[[], bool],
+        _session_id: str,
+    ) -> RunnableAgent:
+        return ImmediateAgent()
+
+    app = create_app(tmp_path, _settings(), agent_factory=factory)
+    with TestClient(app) as client:
+        first = client.post("/api/runs", json={"task": "first task"}).json()
+        _wait_for_status(client, first["id"], {"finished"})
+        second = client.post("/api/runs", json={"task": "second task"}).json()
+        _wait_for_status(client, second["id"], {"finished"})
+
+        history = client.get("/api/runs")
+        first_snapshot = client.get(f"/api/runs/{first['id']}")
+
+    assert history.status_code == 200
+    assert [run["id"] for run in history.json()["runs"]] == [second["id"], first["id"]]
+    assert history.json()["runs"][0] == {
+        "id": second["id"],
+        "task": "second task",
+        "status": "finished",
+    }
+    assert first_snapshot.json()["task"] == "first task"
+    assert first_snapshot.json()["result"]["final_text"] == "Finished first task."
+
+
+def test_web_conversation_supports_multiple_contextual_turns_until_new_chat(tmp_path: Path) -> None:
+    replies = iter(
+        [
+            ModelReply(content="The project codename is Alpha."),
+            ModelReply(content="The codename from the previous turn is Alpha."),
+            ModelReply(content="This is a separate conversation."),
+        ]
+    )
+    models: list[FakeModelClient] = []
+
+    def factory(
+        approval: Callable[[list[str], Path], bool],
+        observer: Callable[[dict[str, object]], None],
+        cancelled: Callable[[], bool],
+        session_id: str,
+    ) -> RunnableAgent:
+        model = FakeModelClient([next(replies)])
+        models.append(model)
+        return Agent(
+            model,
+            build_tool_registry(tmp_path, approval),
+            ContextManager(),
+            TraceRecorder(tmp_path, session_id=session_id, observer=observer),
+            cancelled=cancelled,
+        )
+
+    app = create_app(tmp_path, _settings(), agent_factory=factory)
+    with TestClient(app) as client:
+        first = client.post("/api/runs", json={"task": "Remember the project codename Alpha."}).json()
+        _wait_for_status(client, first["id"], {"finished"})
+
+        second = client.post(
+            "/api/runs",
+            json={"task": "What was the codename?", "conversation_id": first["conversation_id"]},
+        ).json()
+        _wait_for_status(client, second["id"], {"finished"})
+
+        conversation = client.get(f"/api/conversations/{first['conversation_id']}")
+        history = client.get("/api/conversations")
+
+        missing = client.post(
+            "/api/runs",
+            json={"task": "Do not start.", "conversation_id": "0" * 32},
+        )
+
+        separate = client.post("/api/runs", json={"task": "Start separately."}).json()
+        _wait_for_status(client, separate["id"], {"finished"})
+        updated_history = client.get("/api/conversations")
+
+    assert second["conversation_id"] == first["conversation_id"]
+    assert conversation.status_code == 200
+    assert [turn["task"] for turn in conversation.json()["turns"]] == [
+        "Remember the project codename Alpha.",
+        "What was the codename?",
+    ]
+    assert history.json()["conversations"] == [
+        {
+            "id": first["conversation_id"],
+            "title": "Remember the project codename Alpha.",
+            "status": "finished",
+            "turn_count": 2,
+        }
+    ]
+    second_request = models[1].requests[0]
+    assert [message["role"] for message in second_request] == ["system", "user", "assistant", "user"]
+    assert second_request[1]["content"] == "Remember the project codename Alpha."
+    assert second_request[2]["content"] == "The project codename is Alpha."
+    assert second_request[3]["content"] == "What was the codename?"
+    assert missing.status_code == 404
+    assert separate["conversation_id"] != first["conversation_id"]
+    assert len(updated_history.json()["conversations"]) == 2
+
+
+def test_web_uploads_files_into_workspace_without_overwriting(tmp_path: Path) -> None:
+    app = create_app(tmp_path, _settings())
+
+    with TestClient(app) as client:
+        first = client.post(
+            "/api/uploads",
+            params={"filename": "example.py"},
+            content=b"print('first')\n",
+            headers={"content-type": "application/octet-stream"},
+        )
+        second = client.post(
+            "/api/uploads",
+            params={"filename": "example.py"},
+            content=b"print('second')\n",
+            headers={"content-type": "application/octet-stream"},
+        )
+
+    assert first.status_code == 201
+    assert first.json() == {"name": "example.py", "path": "uploads/example.py", "size": 15}
+    assert second.status_code == 201
+    assert second.json()["path"] == "uploads/example-2.py"
+    assert (tmp_path / "uploads" / "example.py").read_bytes() == b"print('first')\n"
+    assert (tmp_path / "uploads" / "example-2.py").read_bytes() == b"print('second')\n"
+
+
+def test_web_upload_rejects_unsafe_names_and_oversized_files(tmp_path: Path) -> None:
+    app = create_app(tmp_path, _settings())
+    upload_headers = {"content-type": "application/octet-stream"}
+
+    with TestClient(app) as client:
+        traversal = client.post(
+            "/api/uploads",
+            params={"filename": "../.env"},
+            content=b"secret",
+            headers=upload_headers,
+        )
+        windows_traversal = client.post(
+            "/api/uploads",
+            params={"filename": r"..\secret.txt"},
+            content=b"secret",
+            headers=upload_headers,
+        )
+        oversized = client.post(
+            "/api/uploads",
+            params={"filename": "large.txt"},
+            content=b"x" * (10 * 1024 * 1024 + 1),
+            headers=upload_headers,
+        )
+        form_upload = client.post(
+            "/api/uploads",
+            params={"filename": "cross-site.txt"},
+            content=b"must not be written",
+            headers={"content-type": "text/plain"},
+        )
+
+    assert traversal.status_code == 400
+    assert windows_traversal.status_code == 400
+    assert oversized.status_code == 413
+    assert form_upload.status_code == 415
+    assert not (tmp_path / ".env").exists()
+    assert not (tmp_path / "secret.txt").exists()
+    assert not (tmp_path / "uploads" / "cross-site.txt").exists()
+
+
+def test_web_passes_uploaded_attachments_to_agent_without_polluting_history_title(tmp_path: Path) -> None:
+    received_tasks: list[str] = []
+
+    class CapturingAgent:
+        def run(self, task: str) -> RunResult:
+            received_tasks.append(task)
+            return RunResult(
+                final_text="Attachment read.",
+                termination_reason=TerminationReason.COMPLETED,
+                verification_status=VerificationStatus.NOT_REQUIRED,
+                changed_files=(),
+                trace_path=str(tmp_path / "trace.jsonl"),
+                steps=1,
+            )
+
+    def factory(
+        _approval: Callable[[list[str], Path], bool],
+        _observer: Callable[[dict[str, object]], None],
+        _cancelled: Callable[[], bool],
+        _session_id: str,
+    ) -> RunnableAgent:
+        return CapturingAgent()
+
+    app = create_app(tmp_path, _settings(), agent_factory=factory)
+    with TestClient(app) as client:
+        uploaded = client.post(
+            "/api/uploads",
+            params={"filename": "notes.txt"},
+            content=b"hello",
+            headers={"content-type": "application/octet-stream"},
+        ).json()
+        started = client.post(
+            "/api/runs",
+            json={"task": "summarize the attachment", "attachments": [uploaded["path"]]},
+        )
+        payload = _wait_for_status(client, started.json()["id"], {"finished"})
+        invalid = client.post(
+            "/api/runs",
+            json={"task": "read a secret", "attachments": ["../.env"]},
+        )
+
+    assert payload["task"] == "summarize the attachment"
+    assert payload["attachments"] == ["uploads/notes.txt"]
+    assert received_tasks == [
+        "summarize the attachment\n\nUser-uploaded workspace files:\n- uploads/notes.txt"
+    ]
+    assert invalid.status_code == 400
+
+
+def test_uploaded_file_is_readable_and_writable_by_real_agent(tmp_path: Path) -> None:
+    models: list[FakeModelClient] = []
+
+    def factory(
+        approval: Callable[[list[str], Path], bool],
+        observer: Callable[[dict[str, object]], None],
+        cancelled: Callable[[], bool],
+        session_id: str,
+    ) -> RunnableAgent:
+        model = FakeModelClient(
+            [
+                ModelReply(
+                    tool_calls=(ToolCall("read-upload", "read_file", {"path": "uploads/notes.txt"}),)
+                ),
+                ModelReply(
+                    tool_calls=(
+                        ToolCall(
+                            "write-upload",
+                            "write_file",
+                            {"path": "uploads/notes.txt", "content": "updated\n"},
+                        ),
+                    )
+                ),
+                ModelReply(content="The attachment is updated."),
+                ModelReply(content="Updated the uploaded file; verification was not run."),
+            ]
+        )
+        models.append(model)
+        return Agent(
+            model,
+            build_tool_registry(tmp_path, approval),
+            ContextManager(),
+            TraceRecorder(tmp_path, session_id=session_id, observer=observer),
+            cancelled=cancelled,
+        )
+
+    app = create_app(tmp_path, _settings(), agent_factory=factory)
+    with TestClient(app) as client:
+        uploaded = client.post(
+            "/api/uploads",
+            params={"filename": "notes.txt"},
+            content=b"original\n",
+            headers={"content-type": "application/octet-stream"},
+        ).json()
+        started = client.post(
+            "/api/runs",
+            json={"task": "read and update the attachment", "attachments": [uploaded["path"]]},
+        )
+        payload = _wait_for_status(client, started.json()["id"], {"finished"})
+
+    assert (tmp_path / "uploads" / "notes.txt").read_text(encoding="utf-8") == "updated\n"
+    assert payload["result"]["changed_files"] == ["uploads/notes.txt"]
+    assert payload["result"]["final_text"] == "Updated the uploaded file; verification was not run."
+    assert "original" in str(models[0].requests[1])
 
 
 def test_web_run_streams_trace_events_and_result(tmp_path: Path) -> None:
@@ -135,7 +453,12 @@ def test_web_command_approval_rejects_wrong_and_stale_ids_and_denial(tmp_path: P
             self.approval = approval
 
         def run(self, _task: str) -> RunResult:
-            decision_seen.append(self.approval(["python", "-V"], tmp_path))
+            decision_seen.append(
+                self.approval(
+                    ["g++", "-std=c++17", "-Wall", "-o", "fibonacci_test.exe", "fibonacci.cpp"],
+                    tmp_path,
+                )
+            )
             return RunResult(
                 final_text="Approval handled.",
                 termination_reason=TerminationReason.COMPLETED,
@@ -159,7 +482,17 @@ def test_web_command_approval_rejects_wrong_and_stale_ids_and_denial(tmp_path: P
         run_id = first.json()["id"]
         waiting = _wait_for_status(client, run_id, {"waiting_approval"})
         approval = waiting["approval"]
-        assert approval["argv"] == ["python", "-V"]
+        assert approval["argv"] == [
+            "g++",
+            "-std=c++17",
+            "-Wall",
+            "-o",
+            "fibonacci_test.exe",
+            "fibonacci.cpp",
+        ]
+        assert approval["description"] == (
+            f"申请在 {tmp_path} 编译 fibonacci.cpp，并生成 fibonacci_test.exe。"
+        )
 
         wrong = client.post(
             f"/api/runs/{run_id}/approval",
@@ -407,7 +740,7 @@ def test_web_cancel_releases_a_running_agent(tmp_path: Path) -> None:
     assert payload["result"]["termination_reason"] == "interrupted"
 
 
-def test_run_manager_evicts_old_completed_runs(tmp_path: Path) -> None:
+def test_run_manager_evicts_old_conversations(tmp_path: Path) -> None:
     class ImmediateAgent:
         def run(self, _task: str) -> RunResult:
             return RunResult(
@@ -446,3 +779,67 @@ def test_run_manager_evicts_old_completed_runs(tmp_path: Path) -> None:
         time.sleep(0.005)
     else:
         raise AssertionError("old completed run was not evicted")
+
+
+def test_run_manager_moves_continued_conversation_to_front_before_eviction(tmp_path: Path) -> None:
+    class ImmediateAgent:
+        def run(self, task: str) -> RunResult:
+            return RunResult(
+                final_text=f"Done: {task}",
+                termination_reason=TerminationReason.COMPLETED,
+                verification_status=VerificationStatus.NOT_REQUIRED,
+                changed_files=(),
+                trace_path=str(tmp_path / "trace.jsonl"),
+                steps=1,
+            )
+
+    def factory(
+        _approval: Callable[[list[str], Path], bool],
+        _observer: Callable[[dict[str, object]], None],
+        _cancelled: Callable[[], bool],
+        _session_id: str,
+    ) -> RunnableAgent:
+        return ImmediateAgent()
+
+    def wait(manager: RunManager, run_id: str) -> None:
+        deadline = time.monotonic() + 1
+        while manager.snapshot(run_id)["status"] != "finished" and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+    manager = RunManager(factory, completed_run_limit=2)
+    first = manager.start("first conversation")
+    wait(manager, str(first["id"]))
+    second = manager.start("second conversation")
+    wait(manager, str(second["id"]))
+    continued = manager.start("continue first", conversation_id=str(first["conversation_id"]))
+    wait(manager, str(continued["id"]))
+
+    assert [item["id"] for item in manager.conversation_history()] == [
+        first["conversation_id"],
+        second["conversation_id"],
+    ]
+    assert manager.conversation_history()[0]["turn_count"] == 2
+
+    third = manager.start("third conversation")
+    wait(manager, str(third["id"]))
+
+    with pytest.raises(RunNotFoundError):
+        manager.conversation_snapshot(str(second["conversation_id"]))
+    assert manager.conversation_snapshot(str(first["conversation_id"]))["turn_count"] == 2
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["python", "-V"], "申请在 C:\\work 查看 Python 版本信息。"),
+        (["python", "-m", "pytest", "-q"], "申请在 C:\\work 运行 Python 模块 pytest。"),
+        (["python", "script.py"], "申请在 C:\\work 运行 Python 脚本 script.py。"),
+        (["pytest", "-q"], "申请在 C:\\work 运行 Python 测试。"),
+        (["git", "status"], "申请在 C:\\work 执行 Git status 操作。"),
+        (["npm.cmd", "run", "test"], "申请在 C:\\work 执行前端任务 run test。"),
+        (["mkdir", "build"], "申请在 C:\\work 新建 build。"),
+        (["rustc", "main.rs"], "申请在 C:\\work 执行 rustc 命令。"),
+    ],
+)
+def test_describe_command_covers_readable_command_families(argv: list[str], expected: str) -> None:
+    assert _describe_command(argv, r"C:\work") == expected

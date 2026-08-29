@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from tracecoder.context import ContextManager
 from tracecoder.domain import (
@@ -54,16 +54,25 @@ class Agent:
         self.max_steps = max_steps
         self.repeat_limit = repeat_limit
         self.cancelled = cancelled or (lambda: False)
+        self._conversation_messages: list[Message] = []
 
-    def run(self, task: str) -> RunResult:
+    @property
+    def conversation_messages(self) -> tuple[Message, ...]:
+        """Return reusable non-system messages from the latest run."""
+
+        return tuple(dict(message) for message in _reusable_messages(self._conversation_messages))
+
+    def run(self, task: str, *, history: Sequence[Message] = ()) -> RunResult:
         """Run one task until a deterministic terminal condition is reached."""
 
         if not task.strip():
             raise ValueError("task must not be empty")
         messages: list[Message] = [
             {"role": "system", "content": SYSTEM_PROMPT.strip()},
+            *(dict(message) for message in history if message.get("role") != "system"),
             {"role": "user", "content": task.strip()},
         ]
+        self._conversation_messages = messages
         changed_files: list[str] = []
         verification = VerificationStatus.NOT_REQUIRED
         shell_side_effects_unknown = False
@@ -72,7 +81,10 @@ class Agent:
         repeat_count = 0
         failures: list[str] = []
         steps = 0
-        self.trace.record("run_started", {"task": task.strip(), "max_steps": self.max_steps})
+        self.trace.record(
+            "run_started",
+            {"task": task.strip(), "max_steps": self.max_steps, "history_messages": len(messages) - 2},
+        )
 
         try:
             for steps in range(1, self.max_steps + 1):
@@ -229,8 +241,20 @@ class Agent:
         steps: int,
         shell_side_effects_unknown: bool,
     ) -> RunResult:
+        safe_final_text = str(self.trace.redact(final_text))
+        last_non_system = next(
+            (message for message in reversed(self._conversation_messages) if message.get("role") != "system"),
+            None,
+        )
+        if (
+            last_non_system is None
+            or last_non_system.get("role") != "assistant"
+            or last_non_system.get("content") != safe_final_text
+            or last_non_system.get("tool_calls")
+        ):
+            self._conversation_messages.append({"role": "assistant", "content": safe_final_text})
         result = RunResult(
-            final_text=str(self.trace.redact(final_text)),
+            final_text=safe_final_text,
             termination_reason=reason,
             verification_status=verification,
             changed_files=tuple(changed_files),
@@ -266,6 +290,42 @@ def _assistant_message(reply: ModelReply) -> Message:
             for call in reply.tool_calls
         ]
     return message
+
+
+def _reusable_messages(messages: list[Message]) -> list[Message]:
+    """Drop system reminders, orphan tools, and incomplete tool-call bundles."""
+
+    reusable: list[Message] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        role = message.get("role")
+        if role == "system" or role == "tool":
+            index += 1
+            continue
+        tool_calls = message.get("tool_calls") if role == "assistant" else None
+        if not isinstance(tool_calls, list) or not tool_calls:
+            reusable.append(message)
+            index += 1
+            continue
+
+        expected_ids = {
+            str(call.get("id"))
+            for call in tool_calls
+            if isinstance(call, dict) and call.get("id") is not None
+        }
+        bundle = [message]
+        response_ids: set[str] = set()
+        index += 1
+        while index < len(messages) and messages[index].get("role") == "tool":
+            tool_message = messages[index]
+            bundle.append(tool_message)
+            if tool_message.get("tool_call_id") is not None:
+                response_ids.add(str(tool_message["tool_call_id"]))
+            index += 1
+        if expected_ids and expected_ids <= response_ids:
+            reusable.extend(bundle)
+    return reusable
 
 
 def _tool_call_payload(call: ToolCall) -> dict[str, object]:

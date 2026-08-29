@@ -37,7 +37,14 @@ jobs:
 
       - name: Verify wheel package data
         run: >-
-          python -c "from pathlib import Path; from zipfile import ZipFile; wheels = list(Path('dist').glob('*.whl')); assert len(wheels) == 1, wheels; archive = ZipFile(wheels[0]); names = set(archive.namelist()); expected = {'tracecoder/py.typed', 'tracecoder/web_static/index.html', 'tracecoder/web_static/app.js', 'tracecoder/web_static/styles.css'}; missing = expected - names; assert not missing, f'Missing wheel assets: {sorted(missing)}'"
+          python -c "from pathlib import Path; from zipfile import ZipFile; wheels = list(Path('dist').glob('*.whl')); assert len(wheels) == 1, wheels; archive = ZipFile(wheels[0]); names = set(archive.namelist()); expected = {'tracecoder/py.typed', 'tracecoder/web_static/index.html', 'tracecoder/web_static/markdown.js', 'tracecoder/web_static/app.js', 'tracecoder/web_static/styles.css'}; missing = expected - names; assert not missing, f'Missing wheel assets: {sorted(missing)}'"
+
+      - name: Check Web JavaScript
+        run: |
+          node --check src/tracecoder/web_static/markdown.js
+          node --check src/tracecoder/web_static/app.js
+          node tests/markdown_smoke.cjs
+          node tests/web_ui_smoke.cjs
 
       - name: Run tests
         run: python -m pytest -q

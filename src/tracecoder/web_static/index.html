@@ -13,68 +13,108 @@
         <span class="brand-mark">T</span>
         <span><strong>TraceCoder</strong><small>local coding agent</small></span>
       </a>
-      <div class="runtime-pill"><span class="status-dot"></span><span id="runtime-label">正在连接本地运行时</span></div>
+      <div class="runtime-pill" role="status">
+        <span class="status-dot"></span>
+        <span id="runtime-label">正在连接本地运行时</span>
+      </div>
     </header>
 
-    <main class="shell">
-      <aside class="context-panel panel">
-        <p class="eyebrow">运行环境</p>
-        <dl class="runtime-details">
-          <div><dt>工作区</dt><dd id="workspace">—</dd></div>
-          <div><dt>模型</dt><dd id="model">—</dd></div>
-          <div><dt>提供方</dt><dd id="provider">—</dd></div>
-        </dl>
-        <div class="notice">
-          <strong>本地执行</strong>
-          <p>文件与命令工具在当前工作区运行。模型请求仍会发送给上方提供方。</p>
+    <main class="app-shell">
+      <aside class="sidebar" aria-label="会话导航">
+        <section class="model-card">
+          <span>当前模型</span>
+          <strong id="model">—</strong>
+        </section>
+
+        <button class="new-chat-button" id="new-chat-button" type="button">
+          <span aria-hidden="true">＋</span>
+          <span>新对话</span>
+        </button>
+
+        <div class="history-heading">
+          <h2>历史对话</h2>
         </div>
-        <div class="run-evidence" id="evidence" hidden>
-          <p class="eyebrow">运行证据</p>
-          <dl class="runtime-details" id="evidence-details"></dl>
-        </div>
+        <nav class="history-list" id="history-list" aria-label="历史对话列表"></nav>
+        <p class="history-empty" id="history-empty">还没有历史对话</p>
       </aside>
 
-      <section class="chat-panel panel">
+      <section class="chat-panel" aria-label="智能体会话">
         <div class="chat-header">
-          <div><p class="eyebrow">智能体会话</p><h1>把编程任务交给 TraceCoder</h1></div>
+          <div>
+            <p class="eyebrow">智能体会话</p>
+            <h1 id="conversation-title">新对话</h1>
+          </div>
           <button class="ghost-button" id="cancel-button" type="button" disabled>停止运行</button>
         </div>
 
         <div class="timeline" id="timeline" aria-live="polite">
           <div class="empty-state" id="empty-state">
-            <div class="empty-icon">⌁</div>
-            <h2>可观察、可审批、可追踪</h2>
-            <p>输入任务后，这里会按顺序展示模型回复、工具请求、执行结果与验证证据。</p>
+            <div class="empty-mark">T</div>
+            <h2>今天想完成什么编程任务？</h2>
+            <p>TraceCoder 会在当前工作区内读取和修改文件；需要执行命令时会先请求你的批准。</p>
           </div>
         </div>
 
         <div class="approval-card" id="approval-card" hidden>
-          <div><span class="warning-badge">需要审批</span><strong>智能体请求执行命令</strong></div>
+          <div class="approval-title">
+            <span class="warning-badge">需要审批</span>
+            <strong>智能体请求执行命令</strong>
+          </div>
+          <p class="approval-description" id="approval-description"></p>
           <p class="mono" id="approval-cwd"></p>
-          <pre id="approval-command"></pre>
+          <details class="exact-command">
+            <summary>查看完整命令</summary>
+            <pre id="approval-command"></pre>
+          </details>
           <div class="approval-actions">
             <button class="ghost-button" id="deny-button" type="button">拒绝</button>
             <button class="primary-button" id="approve-button" type="button">允许执行</button>
           </div>
         </div>
 
-        <form class="composer" id="task-form">
-          <label class="sr-only" for="task-input">编程任务</label>
-          <textarea id="task-input" rows="3" maxlength="20000" placeholder="例如：阅读项目，修复失败测试并验证结果" required></textarea>
-          <div class="composer-footer">
-            <span>命令默认逐次审批</span>
-            <button class="primary-button" id="run-button" type="submit">运行任务 <span>↗</span></button>
+        <div class="composer-dock">
+          <div class="attachment-list" id="attachment-list" aria-live="polite"></div>
+          <form class="composer" id="task-form">
+            <input id="file-input" type="file" multiple hidden>
+            <button class="attach-button" id="attach-button" type="button" title="上传文件" aria-label="上传文件">＋</button>
+            <label class="sr-only" for="task-input">编程任务</label>
+            <textarea id="task-input" rows="1" maxlength="20000" placeholder="向 TraceCoder 发送编程任务" required></textarea>
+            <button class="send-button" id="run-button" type="submit" aria-label="发送任务">↑</button>
+          </form>
+          <div class="composer-hint">
+            <span id="upload-status">附件会保存到工作区 uploads/，Agent 可以继续读写</span>
+            <span>Enter 发送 · Shift+Enter 换行</span>
           </div>
-        </form>
+        </div>
       </section>
     </main>
 
-    <template id="event-template">
-      <article class="event-card">
-        <div class="event-meta"><span class="event-kind"></span><span class="event-index"></span></div>
-        <div class="event-content"></div>
+    <template id="message-template">
+      <article class="message">
+        <div class="message-role"></div>
+        <div class="message-body"></div>
       </article>
     </template>
+
+    <template id="process-template">
+      <details class="process-card">
+        <summary>
+          <span class="process-title">思考与工具过程</span>
+          <span class="process-count">0 条</span>
+          <span class="process-chevron" aria-hidden="true">⌄</span>
+        </summary>
+        <div class="process-events"></div>
+      </details>
+    </template>
+
+    <template id="process-event-template">
+      <div class="process-event">
+        <div class="process-event-meta"><span class="process-kind"></span><span class="process-index"></span></div>
+        <pre class="process-content"></pre>
+      </div>
+    </template>
+
+    <script src="/assets/markdown.js" defer></script>
     <script src="/assets/app.js" defer></script>
   </body>
 </html>
