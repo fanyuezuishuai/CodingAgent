@@ -25,6 +25,7 @@ class ModelReply:
 
     content: str = ""
     tool_calls: tuple[ToolCall, ...] = ()
+    reasoning_content: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

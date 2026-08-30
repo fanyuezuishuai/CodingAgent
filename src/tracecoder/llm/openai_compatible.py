@@ -53,5 +53,12 @@ class OpenAICompatibleClient:
                 calls.append(ToolCall(str(raw_call.id), str(raw_call.function.name), arguments))
             except json.JSONDecodeError as exc:
                 raise ModelProtocolError("Tool arguments contain invalid JSON") from exc
-        return ModelReply(content=message.content or "", tool_calls=tuple(calls))
 
+        reasoning_content = getattr(message, "reasoning_content", None)
+        if reasoning_content is not None and not isinstance(reasoning_content, str):
+            raise ModelProtocolError("Provider reasoning_content must be a string or null")
+        return ModelReply(
+            content=message.content or "",
+            tool_calls=tuple(calls),
+            reasoning_content=reasoning_content,
+        )

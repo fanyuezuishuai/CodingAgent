@@ -12,14 +12,21 @@ from tracecoder.tools import build_tool_registry
 from tracecoder.trace import TraceRecorder, read_trace
 
 
-def _agent(tmp_path: Path, replies: list[ModelReply], *, repeat_limit: int = 3, max_steps: int = 10) -> tuple[Agent, FakeModelClient, TraceRecorder]:
+def _agent(
+    tmp_path: Path,
+    replies: list[ModelReply],
+    *,
+    repeat_limit: int = 3,
+    max_steps: int = 10,
+    context_max_chars: int = 10_000,
+) -> tuple[Agent, FakeModelClient, TraceRecorder]:
     model = FakeModelClient(replies)
     trace = TraceRecorder(tmp_path, secrets=["sentinel-secret"], session_id="agent-test")
     registry = build_tool_registry(tmp_path, lambda _argv, _cwd: True)
     agent = Agent(
         model,
         registry,
-        ContextManager(max_chars=10_000),
+        ContextManager(max_chars=context_max_chars),
         trace,
         max_steps=max_steps,
         repeat_limit=repeat_limit,
@@ -107,6 +114,84 @@ def test_agent_carries_complete_tool_bundles_into_the_next_turn(tmp_path: Path) 
     ]
     assert request[3]["tool_call_id"] == "read-note"
     assert "remember me" in str(request[3]["content"])
+
+
+def test_agent_replays_reasoning_content_after_tool_call_without_tracing_it(tmp_path: Path) -> None:
+    (tmp_path / "note.txt").write_text("remember me", encoding="utf-8")
+    private_state = "opaque-reasoning-state-after-tool-call"
+    agent, model, trace = _agent(
+        tmp_path,
+        [
+            ModelReply(
+                reasoning_content=private_state,
+                tool_calls=(ToolCall("read-note", "read_file", {"path": "note.txt"}),),
+            ),
+            ModelReply(content="I read note.txt."),
+        ],
+    )
+
+    agent.run("Read note.txt.")
+
+    assistant = next(
+        message
+        for message in model.requests[1]
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    )
+    assert assistant["reasoning_content"] == private_state
+    assert private_state not in trace.path.read_text(encoding="utf-8")
+
+
+def test_agent_replays_reasoning_content_across_user_turns(tmp_path: Path) -> None:
+    private_state = "opaque-reasoning-state-from-prior-turn"
+    first_agent, _first_model, _first_trace = _agent(
+        tmp_path,
+        [ModelReply(content="The chosen name is Alpha.", reasoning_content=private_state)],
+    )
+    first_agent.run("Remember that the chosen name is Alpha.")
+
+    second_agent, second_model, _second_trace = _agent(
+        tmp_path,
+        [ModelReply(content="You chose Alpha.")],
+    )
+    second_agent.run("What name did I choose?", history=first_agent.conversation_messages)
+
+    prior_reply = second_model.requests[0][2]
+    assert prior_reply["role"] == "assistant"
+    assert prior_reply["reasoning_content"] == private_state
+
+
+def test_agent_replays_complete_reasoning_history_after_cross_turn_compaction(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "large-note.txt").write_text("remember me " * 250, encoding="utf-8")
+    tool_reasoning = "opaque-tool-reasoning"
+    final_reasoning = "opaque-final-reasoning"
+    first_agent, _first_model, _first_trace = _agent(
+        tmp_path,
+        [
+            ModelReply(
+                reasoning_content=tool_reasoning,
+                tool_calls=(ToolCall("read-note", "read_file", {"path": "large-note.txt"}),),
+            ),
+            ModelReply(content="I read the large note.", reasoning_content=final_reasoning),
+        ],
+    )
+    first_agent.run("Read the large note.")
+
+    second_agent, second_model, _second_trace = _agent(
+        tmp_path,
+        [ModelReply(content="It said remember me.")],
+        context_max_chars=1_500,
+    )
+    second_agent.run("What did it say?", history=first_agent.conversation_messages)
+
+    request = second_model.requests[0]
+    assert [
+        message["reasoning_content"]
+        for message in request
+        if message.get("reasoning_content") is not None
+    ] == [tool_reasoning, final_reasoning]
+    assert any("truncated" in str(message.get("content", "")).casefold() for message in request)
 
 
 def test_unverified_mutation_gets_one_reminder_then_finishes(tmp_path: Path) -> None:

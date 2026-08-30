@@ -277,6 +277,8 @@ class Agent:
 
 def _assistant_message(reply: ModelReply) -> Message:
     message: Message = {"role": "assistant", "content": reply.content}
+    if reply.reasoning_content is not None:
+        message["reasoning_content"] = reply.reasoning_content
     if reply.tool_calls:
         message["tool_calls"] = [
             {

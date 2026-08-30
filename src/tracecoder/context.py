@@ -64,8 +64,31 @@ class ContextManager:
             _bundle_history(messages[latest_user_index + 1 :]),
             self.max_chars,
         )
+        prior_turns = _bundle_conversation_turns(messages[1:latest_user_index])
+        if any(
+            message.get("reasoning_content") is not None
+            for turn in prior_turns
+            for message in turn
+        ):
+            compacted_history = [
+                message
+                for turn in prior_turns
+                for message in _compact_reasoning_history(turn)
+            ]
+            candidate = (
+                [messages[0], fact_message]
+                + compacted_history
+                + [current_request]
+                + current_tail
+            )
+            if _serialized_size(candidate) > self.max_chars:
+                raise ValueError(
+                    "prior conversation exceeds the context budget while preserving reasoning_content"
+                )
+            return candidate
+
         selected: list[list[Message]] = []
-        for bundle in reversed(_bundle_conversation_turns(messages[1:latest_user_index])):
+        for bundle in reversed(prior_turns):
             prior_tail = [message for group in reversed(selected) for message in group]
             candidate = [messages[0], fact_message] + bundle + prior_tail + [current_request] + current_tail
             if _serialized_size(candidate) > self.max_chars:
@@ -116,6 +139,19 @@ def _select_recent_bundles(
 ) -> list[Message]:
     """Select recent complete bundles, compacting the newest one when necessary."""
 
+    if any(message.get("reasoning_content") is not None for bundle in bundles for message in bundle):
+        reasoning_chain = [message for bundle in bundles for message in bundle]
+        if _serialized_size(base + reasoning_chain) <= max_chars:
+            return reasoning_chain
+        compacted_chain = [
+            message for bundle in bundles for message in _compact_bundle(bundle)
+        ]
+        if _serialized_size(base + compacted_chain) <= max_chars:
+            return compacted_chain
+        raise ValueError(
+            "current assistant chain exceeds the context budget while preserving reasoning_content"
+        )
+
     selected: list[list[Message]] = []
     for bundle in reversed(bundles):
         tail = [message for group in reversed(selected) for message in group]
@@ -126,6 +162,8 @@ def _select_recent_bundles(
             compacted = _compact_bundle(bundle)
             if _serialized_size(base + compacted) <= max_chars:
                 selected.append(compacted)
+            elif any(message.get("role") == "assistant" and message.get("tool_calls") for message in bundle):
+                raise ValueError("latest tool-call bundle exceeds the context budget")
         break
     return [message for bundle in reversed(selected) for message in bundle]
 
@@ -136,30 +174,30 @@ def _require_budget_for_mandatory_messages(messages: list[Message], max_chars: i
 
 
 def _compact_bundle(bundle: list[Message]) -> list[Message]:
-    """Preserve message and tool-call structure while replacing bulky payload strings."""
+    """Shrink bulky content without modifying provider-issued assistant protocol state."""
 
     compacted: list[Message] = []
     for message in bundle:
         copied = dict(message)
         content = copied.get("content")
-        if isinstance(content, str) and content:
+        is_reasoning_assistant = (
+            copied.get("role") == "assistant" and copied.get("reasoning_content") is not None
+        )
+        if isinstance(content, str) and content and not is_reasoning_assistant:
             copied["content"] = "[Content truncated to fit the context budget]"
+        compacted.append(copied)
+    return compacted
 
-        tool_calls = copied.get("tool_calls")
-        if isinstance(tool_calls, list):
-            compacted_calls: list[object] = []
-            for call in tool_calls:
-                if not isinstance(call, dict):
-                    compacted_calls.append(call)
-                    continue
-                compacted_call = dict(call)
-                function = compacted_call.get("function")
-                if isinstance(function, dict):
-                    compacted_function = dict(function)
-                    compacted_function["arguments"] = '{"_truncated":true}'
-                    compacted_call["function"] = compacted_function
-                compacted_calls.append(compacted_call)
-            copied["tool_calls"] = compacted_calls
+
+def _compact_reasoning_history(messages: list[Message]) -> list[Message]:
+    """Shrink prior tool results while retaining the complete provider conversation state."""
+
+    compacted: list[Message] = []
+    for message in messages:
+        copied = dict(message)
+        content = copied.get("content")
+        if copied.get("role") == "tool" and isinstance(content, str) and content:
+            copied["content"] = "[Content truncated to fit the context budget]"
         compacted.append(copied)
     return compacted
 

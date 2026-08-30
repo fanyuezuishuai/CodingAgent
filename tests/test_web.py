@@ -139,9 +139,13 @@ def test_web_lists_run_history_newest_first(tmp_path: Path) -> None:
 
 
 def test_web_conversation_supports_multiple_contextual_turns_until_new_chat(tmp_path: Path) -> None:
+    private_state = "opaque-reasoning-state-for-web-history"
     replies = iter(
         [
-            ModelReply(content="The project codename is Alpha."),
+            ModelReply(
+                content="The project codename is Alpha.",
+                reasoning_content=private_state,
+            ),
             ModelReply(content="The codename from the previous turn is Alpha."),
             ModelReply(content="This is a separate conversation."),
         ]
@@ -205,7 +209,9 @@ def test_web_conversation_supports_multiple_contextual_turns_until_new_chat(tmp_
     assert [message["role"] for message in second_request] == ["system", "user", "assistant", "user"]
     assert second_request[1]["content"] == "Remember the project codename Alpha."
     assert second_request[2]["content"] == "The project codename is Alpha."
+    assert second_request[2]["reasoning_content"] == private_state
     assert second_request[3]["content"] == "What was the codename?"
+    assert private_state not in conversation.text
     assert missing.status_code == 404
     assert separate["conversation_id"] != first["conversation_id"]
     assert len(updated_history.json()["conversations"]) == 2
