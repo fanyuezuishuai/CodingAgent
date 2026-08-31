@@ -52,6 +52,16 @@
             <div class="empty-mark">T</div>
             <h2>今天想完成什么编程任务？</h2>
             <p>TraceCoder 会在当前工作区内读取和修改文件；需要执行命令时会先请求你的批准。</p>
+            <div class="scenario-actions" aria-label="课程项目快捷场景">
+              <button id="repair-preset" class="scenario-button" type="button">
+                <strong>修复课程项目</strong>
+                <span>检查、最小修改、运行测试</span>
+              </button>
+              <button id="generate-preset" class="scenario-button" type="button">
+                <strong>生成小型项目</strong>
+                <span>约 5–10 个文件，包含测试</span>
+              </button>
+            </div>
           </div>
         </div>
 
@@ -73,6 +83,7 @@
         </div>
 
         <div class="composer-dock">
+          <div class="scenario-label" id="scenario-label" hidden></div>
           <div class="attachment-list" id="attachment-list" aria-live="polite"></div>
           <form class="composer" id="task-form">
             <input id="file-input" type="file" multiple hidden>
@@ -112,6 +123,28 @@
         <div class="process-event-meta"><span class="process-kind"></span><span class="process-index"></span></div>
         <pre class="process-content"></pre>
       </div>
+    </template>
+
+    <template id="proof-template">
+      <article class="proof-card">
+        <div class="proof-heading">
+          <div><span class="proof-badge">Proof Mode</span><strong>运行证据</strong></div>
+          <span class="proof-status"></span>
+        </div>
+        <p class="proof-summary"></p>
+        <details class="proof-details">
+          <summary>查看 Diff 与命令证据</summary>
+          <div class="proof-section"><h3>文件变化</h3><div class="proof-files"></div></div>
+          <div class="proof-section"><h3>执行命令</h3><div class="proof-commands"></div></div>
+        </details>
+        <p class="proof-warning" hidden></p>
+        <p class="transaction-message"></p>
+        <div class="proof-actions">
+          <a class="ghost-button proof-download">导出 Markdown</a>
+          <button class="ghost-button proof-accept" type="button">接受修改</button>
+          <button class="danger-button proof-rollback" type="button">回滚修改</button>
+        </div>
+      </article>
     </template>
 
     <script src="/assets/markdown.js" defer></script>

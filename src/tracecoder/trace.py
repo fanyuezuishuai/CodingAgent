@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from tracecoder.identifiers import validate_runtime_id
+
 
 class TraceFormatError(ValueError):
     """Raised when a stored trace is not valid JSONL event data."""
@@ -27,9 +29,11 @@ class TraceRecorder:
         session_id: str | None = None,
         observer: Callable[[dict[str, object]], None] | None = None,
     ) -> None:
-        self.session_id = session_id or uuid4().hex
+        self.workspace = workspace.resolve(strict=True)
+        generated_id = uuid4().hex if session_id is None else session_id
+        self.session_id = validate_runtime_id(generated_id, label="session_id")
         self._secrets = tuple(secret for secret in secrets if secret)
-        trace_directory = workspace.resolve(strict=True) / ".tracecoder" / "traces"
+        trace_directory = self.workspace / ".tracecoder" / "traces"
         trace_directory.mkdir(parents=True, exist_ok=True)
         self.path = trace_directory / f"{self.session_id}.jsonl"
         self._sequence = 0

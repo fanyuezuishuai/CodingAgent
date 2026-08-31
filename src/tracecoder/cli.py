@@ -10,9 +10,12 @@ from ipaddress import ip_address
 from pathlib import Path
 
 from tracecoder.config import ConfigError, Settings
-from tracecoder.domain import TerminationReason
+from tracecoder.domain import JSONValue, TerminationReason
+from tracecoder.evidence import write_proof_artifacts
 from tracecoder.runtime import build_agent
+from tracecoder.scenarios import apply_scenario
 from tracecoder.trace import TraceFormatError, read_trace
+from tracecoder.transaction import TransactionError, WorkspaceTransaction
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -30,9 +33,20 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--yes", action="store_true", help="Auto-approve commands with your full host permissions")
     run_parser.add_argument("--max-steps", type=_positive_cli_int, help="Override the configured model-step budget")
     run_parser.add_argument("--repeat-limit", type=_positive_cli_int, help="Override repeated-call termination threshold")
+    run_parser.add_argument(
+        "--scenario",
+        choices=["general", "repair", "generate"],
+        default="general",
+        help="Apply a bounded coursework workflow preset",
+    )
 
     trace_parser = subparsers.add_parser("trace", help="Pretty-print a JSONL run trace")
     trace_parser.add_argument("path", type=Path, help="Path to a trace JSONL file")
+
+    transaction_parser = subparsers.add_parser("transaction", help="Accept or roll back file-tool changes")
+    transaction_parser.add_argument("action", choices=["accept", "rollback"])
+    transaction_parser.add_argument("transaction_id", help="Run/transaction identifier")
+    transaction_parser.add_argument("--workspace", type=Path, default=Path.cwd(), help="Workspace directory")
 
     web_parser = subparsers.add_parser("web", help="Start the local browser interface")
     web_parser.add_argument("--workspace", type=Path, default=Path.cwd(), help="Workspace directory (default: cwd)")
@@ -76,6 +90,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "trace":
         return _show_trace(args.path)
+    if args.command == "transaction":
+        return _run_transaction(args)
     if args.command == "web":
         return _run_web(args)
     return _run_task(args)
@@ -118,7 +134,7 @@ def _run_task(args: argparse.Namespace) -> int:
         max_steps=max_steps,
         repeat_limit=repeat_limit,
     )
-    result = agent.run(task)
+    result = agent.run(apply_scenario(task, args.scenario))
 
     print("\nModel summary")
     print(result.final_text or "(no model text)")
@@ -128,6 +144,20 @@ def _run_task(args: argparse.Namespace) -> int:
     print(f"known changed files: {', '.join(result.changed_files) if result.changed_files else '(none)'}")
     print(f"shell side effects unknown: {str(result.shell_side_effects_unknown).lower()}")
     print(f"trace: {result.trace_path}")
+    if result.proof_json_path:
+        print(f"proof (JSON): {result.proof_json_path}")
+    if result.proof_markdown_path:
+        print(f"proof (Markdown): {result.proof_markdown_path}")
+    print(f"transaction: {result.transaction_state}")
+    if result.rollback_available and result.transaction_id:
+        print(
+            "rollback: tracecoder transaction rollback "
+            f"{result.transaction_id} --workspace {workspace}"
+        )
+        print(
+            "accept:   tracecoder transaction accept "
+            f"{result.transaction_id} --workspace {workspace}"
+        )
     if result.termination_reason is TerminationReason.INTERRUPTED:
         return 130
     return 0 if result.successful else 1
@@ -163,6 +193,38 @@ def _run_web(args: argparse.Namespace) -> int:
     if not _is_loopback_host(args.host):
         print("Security acknowledgement: non-loopback binding relies on your authenticated reverse proxy.")
     start_web_server(workspace, settings, args.host, args.port)
+    return 0
+
+
+def _run_transaction(args: argparse.Namespace) -> int:
+    try:
+        workspace = args.workspace.resolve(strict=True)
+    except FileNotFoundError:
+        print(f"error: workspace does not exist: {args.workspace}", file=sys.stderr)
+        return 2
+    if not workspace.is_dir():
+        print(f"error: workspace is not a directory: {workspace}", file=sys.stderr)
+        return 2
+    try:
+        transaction = WorkspaceTransaction.load(workspace, args.transaction_id)
+        outcome = transaction.rollback() if args.action == "rollback" else transaction.accept()
+    except (TransactionError, ValueError) as exc:
+        print(f"transaction error: {exc}", file=sys.stderr)
+        return 2
+    proof_path = workspace / ".tracecoder" / "proofs" / f"{args.transaction_id}.json"
+    if proof_path.is_file():
+        try:
+            stored = json.loads(proof_path.read_text(encoding="utf-8"))
+            if isinstance(stored, dict):
+                proof: dict[str, JSONValue] = stored
+                transaction_proof = proof.get("transaction")
+                if isinstance(transaction_proof, dict):
+                    transaction_proof["state"] = str(outcome["state"])
+                    transaction_proof["rollback_available"] = bool(outcome["rollback_available"])
+                    write_proof_artifacts(workspace, args.transaction_id, proof)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"warning: transaction succeeded but proof export could not be updated: {exc}", file=sys.stderr)
+    print(json.dumps(outcome, ensure_ascii=False, indent=2))
     return 0
 
 

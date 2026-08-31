@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from pathlib import Path, PureWindowsPath
 
 from tracecoder.domain import JSONValue, ToolResult
+from tracecoder.transaction import TransactionError, WorkspaceTransaction
 
 MAX_FILE_BYTES = 1_000_000
 DEFAULT_MAX_ENTRIES = 200
@@ -67,6 +68,22 @@ class WorkspacePolicy:
             raise WorkspacePathError("invalid_path_type", f"Parent is not a directory: {raw_path}")
         return parent / candidate.name
 
+    def resolve_for_directory(self, raw_path: str) -> Path:
+        """Resolve one absent directory whose canonical parent already exists."""
+
+        relative = self._validate_relative(raw_path)
+        candidate = self.root / relative
+        if candidate.exists() or candidate.is_symlink():
+            raise WorkspacePathError("path_exists", f"Path already exists: {raw_path}")
+        try:
+            parent = candidate.parent.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise WorkspacePathError("path_not_found", f"Parent directory does not exist: {raw_path}") from exc
+        self._require_inside(parent)
+        if not parent.is_dir():
+            raise WorkspacePathError("invalid_path_type", f"Parent is not a directory: {raw_path}")
+        return parent / candidate.name
+
     def relative_display(self, path: Path) -> str:
         """Return a stable POSIX-style path relative to the workspace."""
 
@@ -94,10 +111,16 @@ class WorkspacePolicy:
 
 
 class WorkspaceFileTools:
-    """The five bounded file operations exposed to the model."""
+    """Bounded file operations exposed to the model."""
 
-    def __init__(self, policy: WorkspacePolicy) -> None:
+    def __init__(
+        self,
+        policy: WorkspacePolicy,
+        *,
+        transaction: WorkspaceTransaction | None = None,
+    ) -> None:
         self.policy = policy
+        self.transaction = transaction
 
     def list_files(self, path: str = ".", recursive: bool = False, max_entries: int = DEFAULT_MAX_ENTRIES) -> ToolResult:
         """List safe workspace entries without following directory symlinks."""
@@ -201,6 +224,8 @@ class WorkspaceFileTools:
             target = self.policy.resolve_for_write(path)
             if target.exists() and not overwrite:
                 return ToolResult.failure("path_exists", f"File already exists: {path}")
+            if self.transaction is not None:
+                self.transaction.prepare_file(target)
             _atomic_write(target, content)
             relative = self.policy.relative_display(target)
             return ToolResult.success(
@@ -209,8 +234,30 @@ class WorkspaceFileTools:
             )
         except WorkspacePathError as exc:
             return ToolResult.failure(exc.code, str(exc))
+        except TransactionError as exc:
+            return ToolResult.failure("transaction_error", str(exc))
         except OSError as exc:
             return ToolResult.failure("execution_error", f"Cannot write file: {exc}")
+
+    def create_directory(self, path: str) -> ToolResult:
+        """Create one safe workspace directory whose parent already exists."""
+
+        try:
+            target = self.policy.resolve_for_directory(path)
+            if self.transaction is not None:
+                self.transaction.prepare_directory(target)
+            target.mkdir()
+            relative = self.policy.relative_display(target)
+            return ToolResult.success(
+                {"path": relative},
+                metadata={"changed_directory": relative, "mutation": True},
+            )
+        except WorkspacePathError as exc:
+            return ToolResult.failure(exc.code, str(exc))
+        except TransactionError as exc:
+            return ToolResult.failure("transaction_error", str(exc))
+        except OSError as exc:
+            return ToolResult.failure("execution_error", f"Cannot create directory: {exc}")
 
     def replace_text(
         self,
@@ -236,6 +283,8 @@ class WorkspaceFileTools:
                     f"Expected {expected_replacements} match(es), found {actual}",
                     data={"expected": expected_replacements, "actual": actual},
                 )
+            if self.transaction is not None:
+                self.transaction.prepare_file(target)
             _atomic_write(target, content.replace(old, new, expected_replacements))
             relative = self.policy.relative_display(target)
             return ToolResult.success(
@@ -246,6 +295,8 @@ class WorkspaceFileTools:
             return ToolResult.failure("invalid_text_encoding", f"File is not valid UTF-8: {path}")
         except WorkspacePathError as exc:
             return ToolResult.failure(exc.code, str(exc))
+        except TransactionError as exc:
+            return ToolResult.failure("transaction_error", str(exc))
         except OSError as exc:
             return ToolResult.failure("execution_error", f"Cannot replace text: {exc}")
 

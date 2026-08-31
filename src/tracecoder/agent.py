@@ -8,6 +8,7 @@ from collections.abc import Callable, Sequence
 
 from tracecoder.context import ContextManager
 from tracecoder.domain import (
+    JSONValue,
     Message,
     ModelReply,
     RunResult,
@@ -16,9 +17,11 @@ from tracecoder.domain import (
     ToolResult,
     VerificationStatus,
 )
+from tracecoder.evidence import build_proof, command_evidence, write_proof_artifacts
 from tracecoder.llm.base import ModelClient
 from tracecoder.tools.registry import ToolRegistry
 from tracecoder.trace import TraceRecorder
+from tracecoder.transaction import WorkspaceTransaction
 
 SYSTEM_PROMPT = """You are TraceCoder, a local coding agent.
 Inspect the workspace with tools before changing it. Make focused edits, handle tool errors, and use
@@ -44,6 +47,7 @@ class Agent:
         max_steps: int = 20,
         repeat_limit: int = 3,
         cancelled: Callable[[], bool] | None = None,
+        transaction: WorkspaceTransaction | None = None,
     ) -> None:
         if max_steps <= 0 or repeat_limit <= 0:
             raise ValueError("max_steps and repeat_limit must be positive")
@@ -54,7 +58,10 @@ class Agent:
         self.max_steps = max_steps
         self.repeat_limit = repeat_limit
         self.cancelled = cancelled or (lambda: False)
+        self.transaction = transaction
         self._conversation_messages: list[Message] = []
+        self._current_task = ""
+        self._command_evidence: list[dict[str, JSONValue]] = []
 
     @property
     def conversation_messages(self) -> tuple[Message, ...]:
@@ -67,6 +74,8 @@ class Agent:
 
         if not task.strip():
             raise ValueError("task must not be empty")
+        self._current_task = task.strip()
+        self._command_evidence = []
         messages: list[Message] = [
             {"role": "system", "content": SYSTEM_PROMPT.strip()},
             *(dict(message) for message in history if message.get("role") != "system"),
@@ -162,6 +171,10 @@ class Agent:
                     result = self.registry.execute(call.name, call.arguments)
                     tool_elapsed = round(time.monotonic() - tool_started, 4)
                     redacted_result = self.trace.redact(result.to_dict())
+                    if isinstance(redacted_result, dict):
+                        observed_command = command_evidence(call, result, redacted_result)
+                        if observed_command is not None:
+                            self._command_evidence.append(observed_command)
                     self.trace.record(
                         "tool_result",
                         {
@@ -253,6 +266,32 @@ class Agent:
             or last_non_system.get("tool_calls")
         ):
             self._conversation_messages.append({"role": "assistant", "content": safe_final_text})
+        proof = build_proof(
+            run_id=self.trace.session_id,
+            task=str(self.trace.redact(self._current_task)),
+            termination_reason=reason.value,
+            verification_status=verification.value,
+            changed_files=changed_files,
+            trace_path=str(self.trace.path),
+            steps=steps,
+            shell_side_effects_unknown=shell_side_effects_unknown,
+            commands=self._command_evidence,
+            transaction=self.transaction,
+        )
+        proof_json_path = ""
+        proof_markdown_path = ""
+        try:
+            json_path, markdown_path = write_proof_artifacts(
+                self.trace.workspace,
+                self.trace.session_id,
+                proof,
+            )
+            proof_json_path = str(json_path)
+            proof_markdown_path = str(markdown_path)
+        except OSError as exc:
+            self.trace.record("proof_export_failed", {"error_type": type(exc).__name__})
+        transaction_state = self.transaction.state if self.transaction is not None else "not_required"
+        rollback_available = self.transaction.rollback_available if self.transaction is not None else False
         result = RunResult(
             final_text=safe_final_text,
             termination_reason=reason,
@@ -261,6 +300,12 @@ class Agent:
             trace_path=str(self.trace.path),
             steps=steps,
             shell_side_effects_unknown=shell_side_effects_unknown,
+            proof=proof,
+            transaction_id=self.transaction.id if self.transaction is not None else None,
+            transaction_state=transaction_state,
+            rollback_available=rollback_available,
+            proof_json_path=proof_json_path,
+            proof_markdown_path=proof_markdown_path,
         )
         self.trace.record(
             "run_finished",
@@ -270,6 +315,10 @@ class Agent:
                 "changed_files": changed_files,
                 "steps": steps,
                 "shell_side_effects_unknown": shell_side_effects_unknown,
+                "transaction_state": transaction_state,
+                "rollback_available": rollback_available,
+                "proof_json_path": proof_json_path,
+                "proof_markdown_path": proof_markdown_path,
             },
         )
         return result
@@ -364,6 +413,10 @@ def _update_evidence(
     if isinstance(changed_file, str):
         if changed_file not in changed_files:
             changed_files.append(changed_file)
+        verification = VerificationStatus.REQUIRED
+
+    changed_directory = result.metadata.get("changed_directory") if result.ok else None
+    if isinstance(changed_directory, str):
         verification = VerificationStatus.REQUIRED
 
     process_started = result.metadata.get("shell_side_effects_unknown") is True

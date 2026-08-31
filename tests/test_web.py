@@ -16,6 +16,7 @@ from tracecoder.context import ContextManager
 from tracecoder.domain import ModelReply, RunResult, TerminationReason, ToolCall, VerificationStatus
 from tracecoder.tools import build_tool_registry
 from tracecoder.trace import TraceRecorder, read_trace
+from tracecoder.transaction import WorkspaceTransaction
 from tracecoder.web import RunManager, RunNotFoundError, _describe_command, create_app
 
 
@@ -58,6 +59,9 @@ def test_web_serves_ui_and_public_configuration(tmp_path: Path) -> None:
     assert 'id="history-list"' in page.text
     assert 'id="file-input"' in page.text
     assert 'id="task-input"' in page.text
+    assert 'id="repair-preset"' in page.text
+    assert 'id="generate-preset"' in page.text
+    assert 'id="proof-template"' in page.text
     assert 'id="workspace"' not in page.text
     assert 'id="provider"' not in page.text
     assert config.json() == {
@@ -89,6 +93,9 @@ def test_web_ui_assets_keep_process_collapsed_and_composer_docked(tmp_path: Path
     assert 'request("/api/conversations")' in script.text
     assert "TraceCoderMarkdown.render" in script.text
     assert "/api/uploads?filename=" in script.text
+    assert "/proof.md" in script.text
+    assert "resolveTransaction" in script.text
+    assert "scenario: state.scenario" in script.text
     assert markdown.status_code == 200
     assert "escapeHtml" in markdown.text
     assert "javascript:" in markdown.text
@@ -330,6 +337,54 @@ def test_web_passes_uploaded_attachments_to_agent_without_polluting_history_titl
     assert invalid.status_code == 400
 
 
+@pytest.mark.parametrize(
+    ("scenario", "expected_guidance"),
+    [
+        ("repair", "Scenario: coursework project repair."),
+        ("generate", "roughly 5-10 purposeful files"),
+    ],
+)
+def test_web_scenario_presets_enrich_agent_task_without_changing_visible_task(
+    tmp_path: Path,
+    scenario: str,
+    expected_guidance: str,
+) -> None:
+    received_tasks: list[str] = []
+
+    class CapturingAgent:
+        def run(self, task: str) -> RunResult:
+            received_tasks.append(task)
+            return RunResult(
+                final_text="Done.",
+                termination_reason=TerminationReason.COMPLETED,
+                verification_status=VerificationStatus.NOT_REQUIRED,
+                changed_files=(),
+                trace_path=str(tmp_path / "trace.jsonl"),
+                steps=1,
+            )
+
+    def factory(
+        _approval: Callable[[list[str], Path], bool],
+        _observer: Callable[[dict[str, object]], None],
+        _cancelled: Callable[[], bool],
+        _session_id: str,
+    ) -> RunnableAgent:
+        return CapturingAgent()
+
+    app = create_app(tmp_path, _settings(), agent_factory=factory)
+    with TestClient(app) as client:
+        started = client.post(
+            "/api/runs",
+            json={"task": "build or repair the demo", "scenario": scenario},
+        )
+        payload = _wait_for_status(client, started.json()["id"], {"finished"})
+
+    assert payload["task"] == "build or repair the demo"
+    assert payload["scenario"] == scenario
+    assert expected_guidance in received_tasks[0]
+    assert received_tasks[0].endswith("User task:\nbuild or repair the demo")
+
+
 def test_uploaded_file_is_readable_and_writable_by_real_agent(tmp_path: Path) -> None:
     models: list[FakeModelClient] = []
 
@@ -449,6 +504,159 @@ def test_web_integrates_real_agent_trace_and_run_manager(tmp_path: Path) -> None
     event_types = [event["event_type"] for event in payload["events"]]
     assert event_types == ["run_started", "model_reply", "run_finished"]
     assert payload["result"]["successful"] is True
+
+
+def test_web_exposes_proof_and_can_rollback_latest_file_transaction(tmp_path: Path) -> None:
+    target = tmp_path / "course.py"
+    target.write_text("broken = True\n", encoding="utf-8")
+
+    class TransactionAgent:
+        def __init__(self, session_id: str) -> None:
+            self.session_id = session_id
+
+        def run(self, task: str) -> RunResult:
+            transaction = WorkspaceTransaction(tmp_path, self.session_id)
+            transaction.prepare_file(target)
+            target.write_text("broken = False\n", encoding="utf-8")
+            proof = {
+                "schema_version": 1,
+                "source": "tracecoder_runtime",
+                "run_id": self.session_id,
+                "task": task,
+                "termination_reason": "completed",
+                "verification_status": "verified",
+                "steps": 1,
+                "changed_files": ["course.py"],
+                "file_changes": transaction.file_changes(),
+                "commands": [],
+                "trace_path": str(tmp_path / "trace.jsonl"),
+                "shell_side_effects_unknown": False,
+                "transaction": {
+                    "id": self.session_id,
+                    "state": "pending",
+                    "rollback_available": True,
+                    "scope": "file_tools_only",
+                },
+            }
+            return RunResult(
+                final_text="Fixed.",
+                termination_reason=TerminationReason.COMPLETED,
+                verification_status=VerificationStatus.VERIFIED,
+                changed_files=("course.py",),
+                trace_path=str(tmp_path / "trace.jsonl"),
+                steps=1,
+                proof=proof,
+                transaction_id=self.session_id,
+                transaction_state="pending",
+                rollback_available=True,
+            )
+
+    def factory(
+        _approval: Callable[[list[str], Path], bool],
+        _observer: Callable[[dict[str, object]], None],
+        _cancelled: Callable[[], bool],
+        session_id: str,
+    ) -> RunnableAgent:
+        return TransactionAgent(session_id)
+
+    app = create_app(tmp_path, _settings(), agent_factory=factory)
+    with TestClient(app) as client:
+        started = client.post("/api/runs", json={"task": "repair coursework"})
+        payload = _wait_for_status(client, started.json()["id"], {"finished"})
+        run_id = payload["id"]
+        proof = client.get(f"/api/runs/{run_id}/proof")
+        markdown = client.get(f"/api/runs/{run_id}/proof.md")
+        rolled_back = client.post(f"/api/runs/{run_id}/transaction", json={"action": "rollback"})
+        repeated = client.post(f"/api/runs/{run_id}/transaction", json={"action": "rollback"})
+
+    assert proof.status_code == 200
+    assert proof.json()["source"] == "tracecoder_runtime"
+    assert proof.json()["file_changes"][0]["path"] == "course.py"
+    assert markdown.status_code == 200
+    assert "# TraceCoder Proof" in markdown.text
+    assert rolled_back.status_code == repeated.status_code == 200
+    assert rolled_back.json()["result"]["transaction_state"] == "rolled_back"
+    assert rolled_back.json()["result"]["rollback_available"] is False
+    assert target.read_text(encoding="utf-8") == "broken = True\n"
+
+
+def test_starting_next_turn_auto_accepts_previous_transaction(tmp_path: Path) -> None:
+    target = tmp_path / "course.py"
+    target.write_text("version = 1\n", encoding="utf-8")
+    factory_calls = 0
+
+    class FirstTurnAgent:
+        def __init__(self, session_id: str) -> None:
+            self.session_id = session_id
+
+        def run(self, task: str) -> RunResult:
+            transaction = WorkspaceTransaction(tmp_path, self.session_id)
+            transaction.prepare_file(target)
+            target.write_text("version = 2\n", encoding="utf-8")
+            proof: dict[str, Any] = {
+                "run_id": self.session_id,
+                "task": task,
+                "file_changes": transaction.file_changes(),
+                "commands": [],
+                "transaction": {
+                    "id": self.session_id,
+                    "state": "pending",
+                    "rollback_available": True,
+                },
+            }
+            return RunResult(
+                final_text="Changed.",
+                termination_reason=TerminationReason.COMPLETED,
+                verification_status=VerificationStatus.REQUIRED,
+                changed_files=("course.py",),
+                trace_path=str(tmp_path / "trace.jsonl"),
+                steps=1,
+                proof=proof,
+                transaction_id=self.session_id,
+                transaction_state="pending",
+                rollback_available=True,
+            )
+
+    class FollowUpAgent:
+        def run(self, task: str) -> RunResult:
+            return RunResult(
+                final_text=f"Observed {task}.",
+                termination_reason=TerminationReason.COMPLETED,
+                verification_status=VerificationStatus.NOT_REQUIRED,
+                changed_files=(),
+                trace_path=str(tmp_path / "trace.jsonl"),
+                steps=1,
+            )
+
+    def factory(
+        _approval: Callable[[list[str], Path], bool],
+        _observer: Callable[[dict[str, object]], None],
+        _cancelled: Callable[[], bool],
+        session_id: str,
+    ) -> RunnableAgent:
+        nonlocal factory_calls
+        factory_calls += 1
+        return FirstTurnAgent(session_id) if factory_calls == 1 else FollowUpAgent()
+
+    app = create_app(tmp_path, _settings(), agent_factory=factory)
+    with TestClient(app) as client:
+        started = client.post("/api/runs", json={"task": "change version"}).json()
+        first = _wait_for_status(client, started["id"], {"finished"})
+        follow_up = client.post(
+            "/api/runs",
+            json={"task": "inspect result", "conversation_id": first["conversation_id"]},
+        ).json()
+        _wait_for_status(client, follow_up["id"], {"finished"})
+        previous = client.get(f"/api/runs/{first['id']}").json()
+        rollback = client.post(
+            f"/api/runs/{first['id']}/transaction",
+            json={"action": "rollback"},
+        )
+
+    assert previous["result"]["transaction_state"] == "accepted"
+    assert previous["result"]["rollback_available"] is False
+    assert rollback.status_code == 409
+    assert target.read_text(encoding="utf-8") == "version = 2\n"
 
 
 def test_web_command_approval_rejects_wrong_and_stale_ids_and_denial(tmp_path: Path) -> None:

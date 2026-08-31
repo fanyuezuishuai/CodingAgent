@@ -10,6 +10,7 @@ from tracecoder.context import ContextManager
 from tracecoder.domain import ModelReply, TerminationReason, ToolCall, VerificationStatus
 from tracecoder.tools import build_tool_registry
 from tracecoder.trace import TraceRecorder, read_trace
+from tracecoder.transaction import WorkspaceTransaction
 
 
 def _agent(
@@ -73,6 +74,54 @@ def test_fake_model_can_edit_verify_and_complete(tmp_path: Path) -> None:
     events = read_trace(trace.path)
     assert events[-1]["event_type"] == "run_finished"
     assert events[-1]["payload"]["reason"] == "completed"
+
+
+def test_proof_mode_records_diff_command_evidence_and_local_exports(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    model = FakeModelClient(
+        [
+            ModelReply(
+                tool_calls=(
+                    ToolCall("edit", "replace_text", {"path": "app.py", "old": "1", "new": "2"}),
+                )
+            ),
+            ModelReply(
+                tool_calls=(
+                    ToolCall(
+                        "verify",
+                        "run_command",
+                        {"argv": [sys.executable, "-c", "print('verified')"], "purpose": "verify"},
+                    ),
+                )
+            ),
+            ModelReply(content="Done."),
+        ]
+    )
+    trace = TraceRecorder(tmp_path, session_id="proof-run")
+    transaction = WorkspaceTransaction(tmp_path, trace.session_id)
+    agent = Agent(
+        model,
+        build_tool_registry(tmp_path, lambda _argv, _cwd: True, transaction=transaction),
+        ContextManager(),
+        trace,
+        transaction=transaction,
+    )
+
+    result = agent.run("Change app.py")
+
+    assert result.proof is not None
+    assert result.proof["source"] == "tracecoder_runtime"
+    assert result.proof["file_changes"][0]["path"] == "app.py"
+    assert "+value = 2" in result.proof["file_changes"][0]["diff"]
+    assert result.proof["commands"][0]["purpose"] == "verify"
+    assert result.proof["commands"][0]["exit_code"] == 0
+    assert result.proof["transaction"]["rollback_available"] is True
+    assert Path(result.proof_json_path).is_file()
+    assert Path(result.proof_markdown_path).is_file()
+    markdown = Path(result.proof_markdown_path).read_text(encoding="utf-8")
+    assert "# TraceCoder Proof" in markdown
+    assert "#### stdout" in markdown
+    assert "verified" in markdown
 
 
 def test_agent_carries_structured_conversation_messages_into_the_next_turn(tmp_path: Path) -> None:
@@ -207,6 +256,26 @@ def test_unverified_mutation_gets_one_reminder_then_finishes(tmp_path: Path) -> 
 
     assert result.termination_reason is TerminationReason.COMPLETED
     assert result.verification_status is VerificationStatus.REQUIRED
+    assert len(model.requests) == 3
+    assert any("verification" in str(message.get("content", "")).lower() for message in model.requests[-1])
+
+
+def test_created_directory_requires_verification(tmp_path: Path) -> None:
+    replies = [
+        ModelReply(
+            tool_calls=(
+                ToolCall("mkdir", "create_directory", {"path": "course_project"}),
+            )
+        ),
+        ModelReply(content="Done."),
+        ModelReply(content="I cannot run verification."),
+    ]
+    agent, model, _trace = _agent(tmp_path, replies)
+
+    result = agent.run("Create a course project directory")
+
+    assert result.verification_status is VerificationStatus.REQUIRED
+    assert (tmp_path / "course_project").is_dir()
     assert len(model.requests) == 3
     assert any("verification" in str(message.get("content", "")).lower() for message in model.requests[-1])
 

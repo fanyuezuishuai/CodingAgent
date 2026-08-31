@@ -99,6 +99,12 @@ class RunResult:
     trace_path: str
     steps: int
     shell_side_effects_unknown: bool = False
+    proof: dict[str, JSONValue] | None = None
+    transaction_id: str | None = None
+    transaction_state: str = "not_required"
+    rollback_available: bool = False
+    proof_json_path: str = ""
+    proof_markdown_path: str = ""
 
     @property
     def successful(self) -> bool:

@@ -101,17 +101,35 @@ function processEventTemplate() {
   });
 }
 
+function proofTemplate() {
+  const root = new FakeElement("article", {
+    ".proof-status": new FakeElement("span"),
+    ".proof-summary": new FakeElement("p"),
+    ".proof-files": new FakeElement("div"),
+    ".proof-commands": new FakeElement("div"),
+    ".proof-warning": new FakeElement("p"),
+    ".transaction-message": new FakeElement("p"),
+    ".proof-accept": new FakeElement("button"),
+    ".proof-rollback": new FakeElement("button"),
+    ".proof-download": new FakeElement("a"),
+  });
+  root.classList.add("proof-card");
+  return root;
+}
+
 const selectors = [
   "#task-form", "#task-input", "#run-button", "#cancel-button", "#timeline", "#empty-state",
   "#approval-card", "#approval-description", "#approval-cwd", "#approval-command", ".exact-command",
   "#approve-button", "#deny-button", "#runtime-label", "#model", "#conversation-title", "#history-list",
   "#history-empty", "#new-chat-button", "#attach-button", "#file-input", "#attachment-list", "#upload-status",
+  "#repair-preset", "#generate-preset", "#scenario-label",
 ];
 const elements = Object.fromEntries(selectors.map((selector) => [selector, new FakeElement(selector)]));
 const templates = {
   "#message-template": { content: { firstElementChild: { cloneNode: messageTemplate } } },
   "#process-template": { content: { firstElementChild: { cloneNode: processTemplate } } },
   "#process-event-template": { content: { firstElementChild: { cloneNode: processEventTemplate } } },
+  "#proof-template": { content: { firstElementChild: { cloneNode: proofTemplate } } },
 };
 
 global.document = {
@@ -157,6 +175,16 @@ function runSnapshot(index, requestBody) {
       changed_files: [],
       steps: 1,
       successful: true,
+      proof: index === 0 ? {
+        source: "tracecoder_runtime",
+        verification_status: "verified",
+        steps: 1,
+        file_changes: [{ path: "x.py", kind: "modified", diff: "-old\n+new\n" }],
+        commands: [{ argv: ["python", "-m", "pytest"], purpose: "verify", exit_code: 0 }],
+        transaction: { state: "not_required", rollback_available: false },
+      } : null,
+      transaction_state: "not_required",
+      rollback_available: false,
     },
     error: null,
   };
@@ -246,6 +274,9 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
   const process = elements["#timeline"].children.find((node) => node.name === "details");
   assert.ok(process);
   assert.equal(process.open, false);
+  const proof = elements["#timeline"].children.find((node) => node.classList.contains("proof-card"));
+  assert.ok(proof);
+  assert.match(proof.querySelector(".proof-summary").textContent, /1 个文件证据/);
 
   elements["#task-input"].value = "Second turn";
   await elements["#task-form"].emit("submit", { preventDefault() {} });

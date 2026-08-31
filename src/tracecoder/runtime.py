@@ -11,6 +11,7 @@ from tracecoder.context import ContextManager
 from tracecoder.llm.openai_compatible import OpenAICompatibleClient
 from tracecoder.tools import build_tool_registry
 from tracecoder.trace import TraceRecorder
+from tracecoder.transaction import WorkspaceTransaction
 
 
 def build_agent(
@@ -32,11 +33,13 @@ def build_agent(
         session_id=session_id,
         observer=observer,
     )
+    transaction = WorkspaceTransaction(workspace, trace.session_id)
     registry = build_tool_registry(
         workspace,
         approval,
         default_timeout_seconds=settings.command_timeout_seconds,
         max_output_bytes=settings.command_output_bytes,
+        transaction=transaction,
     )
     model = OpenAICompatibleClient(settings.api_key, settings.base_url, settings.model)
     return Agent(
@@ -47,4 +50,5 @@ def build_agent(
         max_steps=settings.max_steps if max_steps is None else max_steps,
         repeat_limit=settings.repeat_limit if repeat_limit is None else repeat_limit,
         cancelled=cancelled,
+        transaction=transaction,
     )

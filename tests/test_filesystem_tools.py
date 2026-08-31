@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from tracecoder.tools.filesystem import WorkspaceFileTools, WorkspacePolicy
+from tracecoder.transaction import WorkspaceTransaction
 
 
 @pytest.fixture
@@ -81,6 +82,45 @@ def test_write_requires_existing_parent(tools: WorkspaceFileTools) -> None:
 
     assert not result.ok
     assert result.error_code == "path_not_found"
+
+
+def test_create_directory_then_write_file_with_transaction(tmp_path: Path) -> None:
+    transaction = WorkspaceTransaction(tmp_path, "directory-run")
+    tools = WorkspaceFileTools(WorkspacePolicy(tmp_path), transaction=transaction)
+
+    directory_result = tools.create_directory("course_project")
+    write_result = tools.write_file("course_project/main.py", "print('ok')\n")
+
+    assert directory_result.ok
+    assert directory_result.metadata["changed_directory"] == "course_project"
+    assert write_result.ok
+    assert transaction.rollback_available
+    transaction.rollback()
+    assert not (tmp_path / "course_project").exists()
+
+
+def test_create_directory_requires_existing_safe_parent(tmp_path: Path) -> None:
+    tools = WorkspaceFileTools(WorkspacePolicy(tmp_path))
+
+    result = tools.create_directory("missing/nested")
+
+    assert not result.ok
+    assert result.error_code == "path_not_found"
+
+
+def test_transaction_rejects_oversized_snapshot_before_writing(tmp_path: Path) -> None:
+    target = tmp_path / "large.txt"
+    original = "x" * 1_000_001
+    target.write_text(original, encoding="utf-8")
+    transaction = WorkspaceTransaction(tmp_path, "large-snapshot")
+    tools = WorkspaceFileTools(WorkspacePolicy(tmp_path), transaction=transaction)
+
+    result = tools.write_file("large.txt", "replacement", overwrite=True)
+
+    assert not result.ok
+    assert result.error_code == "transaction_error"
+    assert target.read_text(encoding="utf-8") == original
+    assert transaction.state == "not_required"
 
 
 def test_outside_symlink_is_rejected(tools: WorkspaceFileTools, tmp_path: Path) -> None:

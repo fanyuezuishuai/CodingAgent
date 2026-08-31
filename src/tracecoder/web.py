@@ -6,21 +6,25 @@ import threading
 from _thread import LockType
 from collections import deque
 from collections.abc import Callable, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from itertools import islice
 from pathlib import Path
-from typing import Protocol, TypeAlias, runtime_checkable
+from typing import Literal, Protocol, TypeAlias, cast, runtime_checkable
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from tracecoder.config import Settings
-from tracecoder.domain import Message, RunResult, TerminationReason
+from tracecoder.domain import JSONValue, Message, RunResult, TerminationReason
+from tracecoder.evidence import render_proof_markdown, write_proof_artifacts
 from tracecoder.runtime import build_agent
+from tracecoder.scenarios import ScenarioName, apply_scenario
 from tracecoder.trace import TraceRecorder
+from tracecoder.transaction import TransactionError, WorkspaceTransaction
 
 ApprovalCallback: TypeAlias = Callable[[list[str], Path], bool]
 TraceObserver: TypeAlias = Callable[[dict[str, object]], None]
@@ -93,6 +97,7 @@ class _ManagedRun:
     task: str
     attachments: tuple[str, ...]
     prior_messages: tuple[Message, ...]
+    scenario: ScenarioName = "general"
     status: str = "running"
     events: list[dict[str, object]] = field(default_factory=list)
     result: RunResult | None = None
@@ -101,6 +106,9 @@ class _ManagedRun:
     cancel_event: threading.Event = field(default_factory=threading.Event)
     trace: TraceRecorder | None = None
     pending_trace_events: list[tuple[str, dict[str, object]]] = field(default_factory=list)
+    proof: dict[str, JSONValue] | None = None
+    transaction_state: str = "not_required"
+    rollback_available: bool = False
     lock: LockType = field(default_factory=threading.Lock, repr=False)
 
 
@@ -120,15 +128,18 @@ class RunManager:
         agent_factory: AgentFactory,
         *,
         completed_run_limit: int = _DEFAULT_COMPLETED_RUN_LIMIT,
+        workspace: Path | None = None,
     ) -> None:
         if completed_run_limit <= 0:
             raise ValueError("completed_run_limit must be positive")
         self._agent_factory = agent_factory
+        self._workspace = workspace.resolve(strict=True) if workspace is not None else None
         self._runs: dict[str, _ManagedRun] = {}
         self._conversations: dict[str, _ManagedConversation] = {}
         self._conversation_order: deque[str] = deque()
         self._completed_run_limit = completed_run_limit
         self._active_id: str | None = None
+        self._latest_transaction_run_id: str | None = None
         self._lock = threading.Lock()
 
     def start(
@@ -137,6 +148,7 @@ class RunManager:
         *,
         attachments: tuple[str, ...] = (),
         conversation_id: str | None = None,
+        scenario: ScenarioName = "general",
     ) -> dict[str, object]:
         """Start one background run, rejecting overlapping workspace mutations."""
 
@@ -148,6 +160,7 @@ class RunManager:
                 active = self._runs[self._active_id]
                 if active.status in _ACTIVE_STATUSES:
                     raise RunConflictError("another agent run is already active")
+            self._accept_previous_transaction_locked()
             if conversation_id is None:
                 conversation = _ManagedConversation(uuid4().hex, _conversation_title(normalized_task))
                 self._conversations[conversation.id] = conversation
@@ -175,6 +188,7 @@ class RunManager:
                 normalized_task,
                 attachments,
                 conversation.messages,
+                scenario,
             )
             self._runs[run_id] = managed
             conversation.run_ids.append(run_id)
@@ -304,6 +318,63 @@ class RunManager:
             self._record_control_event(managed, "cancel_requested", {})
         return self.snapshot(run_id)
 
+    def proof(self, run_id: str) -> dict[str, JSONValue]:
+        """Return the runtime-owned proof report for one completed run."""
+
+        managed = self._get(run_id)
+        with managed.lock:
+            if managed.proof is None:
+                raise RunConflictError("proof is unavailable for this run")
+            return deepcopy(managed.proof)
+
+    def resolve_transaction(self, run_id: str, action: str) -> dict[str, object]:
+        """Accept or roll back the latest completed file-tool transaction."""
+
+        if self._workspace is None:
+            raise RunConflictError("transaction control is unavailable")
+        managed = self._get(run_id)
+        with self._lock:
+            if self._active_id is not None:
+                active = self._runs[self._active_id]
+                if active.status in _ACTIVE_STATUSES:
+                    raise RunConflictError("cannot change a transaction while an agent run is active")
+            with managed.lock:
+                if managed.status not in _TERMINAL_STATUSES or managed.result is None:
+                    raise RunConflictError("run has not finished")
+                transaction_id = managed.result.transaction_id
+                if transaction_id is None:
+                    raise RunConflictError("run has no file-tool transaction")
+                if (
+                    action == "rollback"
+                    and managed.transaction_state == "pending"
+                    and self._latest_transaction_run_id != run_id
+                ):
+                    raise RunConflictError("only the latest pending transaction can be rolled back")
+                try:
+                    transaction = WorkspaceTransaction.load(self._workspace, transaction_id)
+                    outcome = transaction.rollback() if action == "rollback" else transaction.accept()
+                except TransactionError as exc:
+                    raise RunConflictError(str(exc)) from exc
+                managed.transaction_state = str(outcome["state"])
+                managed.rollback_available = bool(outcome["rollback_available"])
+                self._update_transaction_proof_locked(managed)
+                self._append_event_locked(
+                    managed,
+                    f"transaction_{managed.transaction_state}",
+                    {"transaction_id": transaction_id, "action": action},
+                )
+                trace = managed.trace
+                if self._latest_transaction_run_id == run_id:
+                    self._latest_transaction_run_id = None
+                snapshot = self._snapshot_locked(managed)
+        if trace is not None:
+            trace.record(
+                f"transaction_{managed.transaction_state}",
+                {"transaction_id": transaction_id, "action": action},
+                notify_observer=False,
+            )
+        return snapshot
+
     def _execute(self, managed: _ManagedRun) -> None:
         def observer(event: dict[str, object]) -> None:
             event_type = str(event.get("event_type", "runtime_event"))
@@ -339,7 +410,11 @@ class RunManager:
             )
             return decision
 
-        agent_task = _agent_task_with_attachments(managed.task, list(managed.attachments))
+        agent_task = _agent_task_with_attachments(
+            managed.task,
+            list(managed.attachments),
+            managed.scenario,
+        )
         conversation_messages: tuple[Message, ...] | None = None
         result: RunResult | None = None
         terminal_status = "failed"
@@ -380,6 +455,12 @@ class RunManager:
                     managed.error = run_error
                     managed.approval = None
                     managed.prior_messages = ()
+                    if result is not None:
+                        managed.proof = deepcopy(result.proof) if result.proof is not None else None
+                        managed.transaction_state = result.transaction_state
+                        managed.rollback_available = result.rollback_available
+                        if result.rollback_available:
+                            self._latest_transaction_run_id = managed.id
                     if error_type is not None:
                         self._append_event_locked(managed, "web_runner_error", {"error_type": error_type})
                 conversation = self._conversations.get(managed.conversation_id)
@@ -425,6 +506,54 @@ class RunManager:
             }
         )
 
+    def _accept_previous_transaction_locked(self) -> None:
+        """Auto-accept the previous run before a newer run can build on it."""
+
+        run_id = self._latest_transaction_run_id
+        if run_id is None or self._workspace is None:
+            return
+        managed = self._runs.get(run_id)
+        if managed is None:
+            self._latest_transaction_run_id = None
+            return
+        with managed.lock:
+            if managed.result is None or managed.result.transaction_id is None:
+                self._latest_transaction_run_id = None
+                return
+            try:
+                transaction = WorkspaceTransaction.load(self._workspace, managed.result.transaction_id)
+                outcome = transaction.accept()
+            except TransactionError as exc:
+                raise RunConflictError(f"could not accept previous transaction: {exc}") from exc
+            managed.transaction_state = str(outcome["state"])
+            managed.rollback_available = False
+            self._update_transaction_proof_locked(managed)
+            self._append_event_locked(
+                managed,
+                "transaction_accepted",
+                {"transaction_id": managed.result.transaction_id, "action": "auto_accept_before_next_run"},
+            )
+            if managed.trace is not None:
+                managed.trace.record(
+                    "transaction_accepted",
+                    {"transaction_id": managed.result.transaction_id, "action": "auto_accept_before_next_run"},
+                    notify_observer=False,
+                )
+        self._latest_transaction_run_id = None
+
+    def _update_transaction_proof_locked(self, managed: _ManagedRun) -> None:
+        if managed.proof is None:
+            return
+        transaction = managed.proof.get("transaction")
+        if isinstance(transaction, dict):
+            transaction["state"] = managed.transaction_state
+            transaction["rollback_available"] = managed.rollback_available
+        if self._workspace is not None:
+            try:
+                write_proof_artifacts(self._workspace, managed.id, managed.proof)
+            except OSError:
+                self._append_event_locked(managed, "proof_export_failed", {"error_type": "OSError"})
+
     @staticmethod
     def _snapshot_locked(managed: _ManagedRun, *, after: int = 0) -> dict[str, object]:
         pending = managed.approval
@@ -438,6 +567,7 @@ class RunManager:
             }
         result: dict[str, object] | None = None
         if managed.result is not None:
+            proof = deepcopy(managed.proof) if managed.proof is not None else None
             result = {
                 "final_text": managed.result.final_text,
                 "termination_reason": managed.result.termination_reason.value,
@@ -447,6 +577,12 @@ class RunManager:
                 "steps": managed.result.steps,
                 "shell_side_effects_unknown": managed.result.shell_side_effects_unknown,
                 "successful": managed.result.successful,
+                "proof": proof,
+                "transaction_id": managed.result.transaction_id,
+                "transaction_state": managed.transaction_state,
+                "rollback_available": managed.rollback_available,
+                "proof_json_path": managed.result.proof_json_path,
+                "proof_markdown_path": managed.result.proof_markdown_path,
             }
         return {
             "id": managed.id,
@@ -455,6 +591,7 @@ class RunManager:
             "turn_index": managed.turn_index,
             "task": managed.task,
             "attachments": list(managed.attachments),
+            "scenario": managed.scenario,
             "status": managed.status,
             "events": [event.copy() for event in managed.events[after:]],
             "next_event_id": len(managed.events),
@@ -470,6 +607,7 @@ class StartRunRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     task: str = Field(min_length=1, max_length=20_000)
     attachments: list[str] = Field(default_factory=list, max_length=20)
+    scenario: ScenarioName = "general"
     conversation_id: str | None = Field(default=None, min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$")
 
     @field_validator("task")
@@ -492,6 +630,12 @@ class ApprovalRequest(BaseModel):
 
     approval_id: str = Field(min_length=1, max_length=64)
     approved: bool
+
+
+class TransactionRequest(BaseModel):
+    """One explicit decision for a completed file-tool transaction."""
+
+    action: Literal["accept", "rollback"]
 
 
 def _validate_upload_name(filename: str) -> str:
@@ -563,17 +707,22 @@ def _resolve_attachments(workspace: Path, attachments: list[str]) -> list[str]:
     return resolved
 
 
-def _agent_task_with_attachments(task: str, attachments: list[str]) -> str:
+def _agent_task_with_attachments(
+    task: str,
+    attachments: list[str],
+    scenario: ScenarioName = "general",
+) -> str:
+    enriched_task = apply_scenario(task, scenario)
     if not attachments:
-        return task
+        return enriched_task
     attachment_list = "\n".join(f"- {attachment}" for attachment in attachments)
-    return f"{task}\n\nUser-uploaded workspace files:\n{attachment_list}"
+    return f"{enriched_task}\n\nUser-uploaded workspace files:\n{attachment_list}"
 
 
 def _fallback_conversation_messages(managed: _ManagedRun, final_text: str) -> tuple[Message, ...]:
     """Build basic cross-turn context for a custom Agent without history support."""
 
-    task = _agent_task_with_attachments(managed.task, list(managed.attachments))
+    task = _agent_task_with_attachments(managed.task, list(managed.attachments), managed.scenario)
     return (
         *(dict(message) for message in managed.prior_messages),
         {"role": "user", "content": task},
@@ -696,7 +845,7 @@ def create_app(
 
         agent_factory = configured_factory
 
-    manager = RunManager(agent_factory)
+    manager = RunManager(agent_factory, workspace=canonical_workspace)
     app = FastAPI(title="TraceCoder Local Web", docs_url=None, redoc_url=None)
     app.state.run_manager = manager
     app.mount("/assets", StaticFiles(directory=_STATIC_DIRECTORY), name="assets")
@@ -721,6 +870,7 @@ def create_app(
                 request.task,
                 attachments=tuple(attachments),
                 conversation_id=request.conversation_id,
+                scenario=request.scenario,
             )
         except (OSError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -769,6 +919,38 @@ def create_app(
             return manager.snapshot(run_id, after=after)
         except RunNotFoundError as exc:
             raise HTTPException(status_code=404, detail="run not found") from exc
+
+    @app.get("/api/runs/{run_id}/proof")
+    def run_proof(run_id: str) -> dict[str, object]:
+        try:
+            return cast(dict[str, object], manager.proof(run_id))
+        except RunNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="run not found") from exc
+        except RunConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/runs/{run_id}/proof.md")
+    def run_proof_markdown(run_id: str) -> Response:
+        try:
+            content = render_proof_markdown(manager.proof(run_id))
+        except RunNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="run not found") from exc
+        except RunConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return Response(
+            content=content,
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="tracecoder-proof-{run_id}.md"'},
+        )
+
+    @app.post("/api/runs/{run_id}/transaction")
+    def resolve_run_transaction(run_id: str, request: TransactionRequest) -> dict[str, object]:
+        try:
+            return manager.resolve_transaction(run_id, request.action)
+        except RunNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="run not found") from exc
+        except RunConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/runs/{run_id}/approval")
     def resolve_approval(run_id: str, request: ApprovalRequest) -> dict[str, object]:

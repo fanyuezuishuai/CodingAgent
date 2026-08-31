@@ -6,6 +6,7 @@ from pathlib import Path
 from tracecoder.tools.filesystem import WorkspaceFileTools, WorkspacePolicy
 from tracecoder.tools.registry import ToolDefinition, ToolRegistry
 from tracecoder.tools.shell import RunCommandTool
+from tracecoder.transaction import WorkspaceTransaction
 
 __all__ = [
     "RunCommandTool",
@@ -23,11 +24,12 @@ def build_tool_registry(
     *,
     default_timeout_seconds: int = 60,
     max_output_bytes: int = 20_000,
+    transaction: WorkspaceTransaction | None = None,
 ) -> ToolRegistry:
-    """Create the six built-in tools for one canonical workspace."""
+    """Create the seven built-in tools for one canonical workspace."""
 
     policy = WorkspacePolicy(workspace)
-    files = WorkspaceFileTools(policy)
+    files = WorkspaceFileTools(policy, transaction=transaction)
     shell = RunCommandTool(
         policy.root,
         approval,
@@ -37,6 +39,18 @@ def build_tool_registry(
     registry = ToolRegistry()
 
     object_schema = {"type": "object", "additionalProperties": False}
+    registry.register(
+        ToolDefinition(
+            "create_directory",
+            "Create one directory inside the workspace. Its parent directory must already exist.",
+            {
+                **object_schema,
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+            files.create_directory,
+        )
+    )
     registry.register(
         ToolDefinition(
             "list_files",
@@ -135,4 +149,3 @@ def build_tool_registry(
         )
     )
     return registry
-

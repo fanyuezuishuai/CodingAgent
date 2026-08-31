@@ -16,7 +16,7 @@ TraceCoder 是一个从零实现的本地编程智能体（coding agent）。用
 | 功能 | 实现 |
 |---|---|
 | 自主 Agent 循环 | 模型回复、工具调用、工具结果回传和继续推理组成有界循环 |
-| 六个本地工具 | 目录浏览、文本搜索、文件读取、文件写入、精确替换、命令执行 |
+| 七个本地工具 | 安全建目录、目录浏览、文本搜索、文件读取、文件写入、精确替换、命令执行 |
 | 工具参数校验 | 自行实现 JSON Schema 子集校验；未知工具和错误参数以结构化结果返回 |
 | 工作区文件安全 | 拒绝绝对路径、`..`、越界符号链接以及工作区根目录顶层的 `.env`、`.git`、`.tracecoder` |
 | 命令审批 | CLI/Web 均在执行前展示真实 argv 和 cwd；Web 同时显示中文用途说明 |
@@ -26,6 +26,9 @@ TraceCoder 是一个从零实现的本地编程智能体（coding agent）。用
 | DeepSeek 思考模式 | 解析并原样回传可选 `reasoning_content`，支持跨工具步骤和跨用户轮次继续请求 |
 | 上下文压缩 | 超预算时保留当前问题、运行时事实、最近轮次和完整 tool-call/result 包；不篡改模型协议状态 |
 | 可追踪运行 | 每次运行写入按序、带时间、递归脱敏的 JSONL 事件轨迹 |
+| Proof Mode | 从真实 Diff、命令退出码、验证状态和终止原因生成 JSON/Markdown 证据，不采信模型自述 |
+| 事务式回滚 | 修改前保存文件快照，可接受或回滚文件工具产生的创建与覆盖操作 |
+| 课程项目场景 | 同一个 Agent 提供“修复现有项目”和“生成小型带测试项目”两种任务预设 |
 | 本地 Web GUI | 历史对话、Markdown 回答、折叠过程、文件上传、审批、停止和刷新恢复 |
 | 自动化质量检查 | GitHub Actions 在 Windows/Linux、Python 3.11/3.13 上测试、检查并构建 wheel |
 
@@ -103,6 +106,13 @@ tracecoder web --workspace D:\path\to\project
 .\.venv\Scripts\tracecoder.exe run "阅读项目，修复失败测试并验证" --workspace .
 ```
 
+也可以使用课程项目预设：
+
+```powershell
+.\.venv\Scripts\tracecoder.exe run "修复计算器项目" --workspace . --scenario repair
+.\.venv\Scripts\tracecoder.exe run "课题：计算器；目标目录：course_project" --workspace . --scenario generate
+```
+
 默认情况下，每条命令都需要用户批准。在 CLI 审批提示中按 `Ctrl+C` 会把当前命令视为拒绝，Agent 可以继续后续步骤；如果 `KeyboardInterrupt` 传播到 `Agent.run()`，本次运行会标记为 `interrupted`。只有明确了解风险时才使用自动批准：
 
 ```powershell
@@ -125,6 +135,20 @@ CLI 和 Web 每次运行都会在工作区生成：
 .\.venv\Scripts\tracecoder.exe trace .tracecoder\traces\<session-id>.jsonl
 ```
 
+Proof Mode 还会生成：
+
+```text
+.tracecoder/proofs/<session-id>.json
+.tracecoder/proofs/<session-id>.md
+```
+
+CLI 结束时会显示事务 ID。确认或回滚文件工具修改：
+
+```powershell
+tracecoder transaction accept <session-id> --workspace .
+tracecoder transaction rollback <session-id> --workspace .
+```
+
 ## 架构
 
 ```mermaid
@@ -140,9 +164,10 @@ flowchart TB
     AGENT --> MODEL[OpenAI-compatible 模型适配器]
     AGENT --> REGISTRY[工具注册表]
     AGENT --> CONTEXT[上下文管理器]
-    AGENT --> TRACE[JSONL 轨迹]
+    AGENT --> TRACE[JSONL 轨迹与 Proof]
+    AGENT --> TX[文件事务快照]
 
-    REGISTRY --> FILES[5 个工作区文件工具]
+    REGISTRY --> FILES[6 个工作区文件工具]
     REGISTRY --> SHELL[1 个审批命令工具]
     MODEL --> PROVIDER[用户配置的模型 API]
 ```
@@ -184,10 +209,14 @@ sequenceDiagram
 | `src/tracecoder/context.py` | 单轮/多轮消息的确定性预算压缩 |
 | `src/tracecoder/runtime.py` | 为 CLI/Web 统一装配模型、工具、上下文和轨迹 |
 | `src/tracecoder/config.py` | `.env`、系统环境变量、默认值与配置校验 |
+| `src/tracecoder/identifiers.py` | 轨迹、Proof 与事务文件名使用的安全运行标识校验 |
 | `src/tracecoder/trace.py` | 追加式 JSONL 轨迹、顺序锁和递归凭据脱敏 |
+| `src/tracecoder/evidence.py` | 运行时 Proof 数据、Markdown/JSON 导出 |
+| `src/tracecoder/transaction.py` | 文件工具修改前快照、接受与安全回滚 |
+| `src/tracecoder/scenarios.py` | 课程项目修复与小型项目生成任务预设 |
 | `src/tracecoder/llm/` | Provider-neutral 模型协议和 OpenAI-compatible 适配器 |
 | `src/tracecoder/tools/` | 工具 Schema、参数验证、工作区文件操作和命令执行 |
-| `src/tracecoder/cli.py` | `run`、`trace`、`web` 三个命令 |
+| `src/tracecoder/cli.py` | `run`、`trace`、`transaction`、`web` 命令 |
 | `src/tracecoder/web.py` | FastAPI、后台运行、会话历史、上传、审批和取消 |
 | `src/tracecoder/web_static/` | 原生 HTML/CSS/JS GUI 与安全 Markdown 渲染 |
 
@@ -197,7 +226,7 @@ sequenceDiagram
 
 1. 根据已知修改、验证状态和最近失败生成运行时事实；
 2. 通过 `ContextManager` 把消息限制在字符预算内；
-3. 把消息与六个工具的 JSON Schema 发送给模型；
+3. 把消息与七个工具的 JSON Schema 发送给模型；
 4. 记录模型回复；
 5. 校验并按顺序执行每个工具调用；
 6. 将脱敏后的工具结果按 `tool_call_id` 放回消息历史；
@@ -212,7 +241,7 @@ sequenceDiagram
 - `repeated_call`：连续重复相同工具和参数；
 - `provider_error`：模型 API 或响应协议错误。
 
-运行结束时，CLI/Web 展示的修改文件、验证状态和终止原因来自本地运行时，而不是模型自述。
+运行结束时，CLI/Web 展示的修改文件、统一 Diff、命令退出码、验证状态和终止原因来自本地运行时，而不是模型自述。Proof 不包含 `reasoning_content`。
 
 Web 停止采用协作式取消：待审批命令会立即解除，但正在进行的模型请求或工具调用返回后，Agent 才能结束。
 
@@ -220,6 +249,7 @@ Web 停止采用协作式取消：待审批命令会立即解除，但正在进�
 
 | 工具 | 示例用途 |
 |---|---|
+| `create_directory` | 在已有安全父目录下新建一个目录 |
 | `list_files` | 查看目录结构 |
 | `search_text` | 定位函数、类或错误文本 |
 | `read_file` | 按行读取 UTF-8 文本 |
@@ -228,6 +258,8 @@ Web 停止采用协作式取消：待审批命令会立即解除，但正在进�
 | `run_command` | 执行编译、测试、格式化或其他批准命令 |
 
 文件工具只接受工作区相对路径。保留路径规则只检查工作区根目录的顶层条目；例如 `service/.env` 不会被该规则阻止。写入使用同目录临时文件和 `os.replace` 完成原子替换；精确替换会核对实际匹配数量，防止一次模糊请求误改多个位置。
+
+每次文件写入、精确替换或建目录之前，事务模块会先记录原始状态。回滚会恢复被覆盖文件、删除本轮创建文件，并只删除本轮创建且仍为空的目录。单个原文件快照上限为 1,000,000 字节；超过上限时本次修改会在写入前失败，避免产生无法回滚的文件工具修改。开始新的修改事务会自动接受上一个尚未处理的事务，因此只能回滚最新一轮待确认修改。
 
 命令工具使用参数数组和 `shell=False`，不会隐式解释管道、重定向或 `&&`。确实需要 Shell 语法时，模型必须显式请求 `cmd /c` 或 `sh -lc`，用户能在审批界面看到完整参数。
 
@@ -248,6 +280,9 @@ Web GUI 使用 FastAPI + 原生 HTML/CSS/JavaScript，不依赖前端框架或�
 - 命令中文用途说明和可展开的完整 argv；
 - 停止运行和待审批解除；
 - 页面刷新后重新发现活动任务；
+- Proof Mode 证据卡、Diff/命令详情和 Markdown 导出；
+- 文件工具修改的“接受修改 / 回滚修改”；
+- 课程项目修复与小型项目生成快捷场景；
 - 丢失提交响应、历史切换和上传切换等异步竞态保护。
 
 会话消息保存在当前 Web 服务进程内存中。历史过长时，模型请求会被 `ContextManager` 压缩；服务重启后历史会清空，这与“模型请求上下文压缩”是两个不同层面的概念。
@@ -330,6 +365,8 @@ node tests\web_ui_smoke.cjs
 - 命令拒绝、无隐式 Shell、超时、输出限制和凭据隔离；
 - 重复调用、最大步数、模型错误和协作取消；
 - JSONL 脱敏与并发记录；
+- Proof JSON/Markdown、文件 Diff、事务接受/回滚和异常目录保护；
+- 课程项目修复、生成 5～10 个文件的小型项目并真实运行测试；
 - Web 会话、上传、审批、停止、刷新恢复和会话淘汰；
 - Markdown XSS 防护与真实前端脚本 DOM 流程。
 - 禁止 Agent 框架、服务端托管执行/文件工具及 `README.txt` 字数上限的合规回归检查。
@@ -346,8 +383,12 @@ GitHub Actions 会在 Ubuntu/Windows 与 Python 3.11/3.13 组合中执行测试�
 │  ├─ config.py
 │  ├─ context.py
 │  ├─ domain.py
+│  ├─ evidence.py
+│  ├─ identifiers.py
 │  ├─ runtime.py
+│  ├─ scenarios.py
 │  ├─ trace.py
+│  ├─ transaction.py
 │  ├─ llm/
 │  ├─ tools/
 │  └─ web_static/
@@ -365,6 +406,9 @@ GitHub Actions 会在 Ubuntu/Windows 与 Python 3.11/3.13 组合中执行测试�
 - 同一工作区只允许一个活动任务；
 - 模型和工具调用为同步执行，Web 停止采用协作式取消；
 - 文件工具主要面向 UTF-8 文本，不是二进制文件编辑器；
+- 事务回滚只保证 TraceCoder 文件工具产生的修改；`run_command` 可能产生任意副作用，Proof 会明确提示；
+- 命令若在新建目录中留下未记录文件（例如缓存），回滚会在改动任何文件前拒绝部分清理并报告具体路径；
+- 小型项目生成重点保证约 5～10 个文件的课程演示，默认偏向 Python 标准库与 `unittest`，不承诺大型或任意技术栈项目；
 - 内置 Markdown 渲染器支持常用子集，不是完整 CommonMark；
 - 没有完整网页 IDE、多智能体、插件市场或远程托管执行；
 - 运行真实任务需要用户自行提供支持 tool calling 的模型 API。

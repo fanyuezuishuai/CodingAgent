@@ -15,11 +15,13 @@ const state = {
   processNodes: new Map(),
   deferredProcessEvents: new Map(),
   finalRenderedRunIds: new Set(),
+  proofNodes: new Map(),
   deferScroll: false,
   running: false,
   uploading: false,
   attachments: [],
   conversations: [],
+  scenario: "general",
 };
 
 const elements = {
@@ -46,6 +48,9 @@ const elements = {
   fileInput: document.querySelector("#file-input"),
   attachmentList: document.querySelector("#attachment-list"),
   uploadStatus: document.querySelector("#upload-status"),
+  repairPreset: document.querySelector("#repair-preset"),
+  generatePreset: document.querySelector("#generate-preset"),
+  scenarioLabel: document.querySelector("#scenario-label"),
 };
 
 async function request(url, options = {}) {
@@ -69,6 +74,8 @@ function eventLabel(type) {
     approval_required: "等待命令审批",
     approval_resolved: "命令审批结果",
     run_finished: "运行结束",
+    transaction_accepted: "已接受修改",
+    transaction_rolled_back: "已回滚修改",
     cancel_requested: "停止请求",
     running: "正在运行",
     waiting_approval: "等待审批",
@@ -111,6 +118,7 @@ function resetTimeline() {
   state.processNodes = new Map();
   state.deferredProcessEvents = new Map();
   state.finalRenderedRunIds = new Set();
+  state.proofNodes = new Map();
   updateApproval(null);
 }
 
@@ -206,10 +214,126 @@ function renderFinalAnswer(runId, result, error) {
   appendMessage("assistant", finalText);
 }
 
+function appendEvidenceBlock(container, title, content, className) {
+  const details = document.createElement("details");
+  details.className = className;
+  const summary = document.createElement("summary");
+  summary.textContent = title;
+  const pre = document.createElement("pre");
+  pre.textContent = content;
+  details.append(summary, pre);
+  container.appendChild(details);
+}
+
+function fillProofNode(runId, node, result) {
+  const proof = result?.proof || {};
+  const verification = proof.verification_status || result?.verification_status || "unknown";
+  const changes = Array.isArray(proof.file_changes) ? proof.file_changes : [];
+  const commands = Array.isArray(proof.commands) ? proof.commands : [];
+  const transaction = proof.transaction || {};
+  const transactionState = result?.transaction_state || transaction.state || "not_required";
+  const rollbackAvailable = Boolean(result?.rollback_available ?? transaction.rollback_available);
+
+  node.querySelector(".proof-status").textContent = verification === "verified" ? "验证通过" : `验证：${verification}`;
+  node.querySelector(".proof-summary").textContent = `${changes.length} 个文件证据 · ${commands.length} 条命令证据 · ${proof.steps || result?.steps || 0} 个模型步骤`;
+
+  const files = node.querySelector(".proof-files");
+  files.replaceChildren();
+  if (changes.length) {
+    for (const change of changes) {
+      appendEvidenceBlock(
+        files,
+        `${change.path || "未知文件"} · ${change.kind || "changed"}`,
+        typeof change.diff === "string" ? change.diff : `Diff 不可用：${change.diff_unavailable_reason || "unknown"}`,
+        "proof-change",
+      );
+    }
+  } else {
+    files.textContent = "没有记录到文件工具产生的净变化。";
+  }
+
+  const commandList = node.querySelector(".proof-commands");
+  commandList.replaceChildren();
+  if (commands.length) {
+    commands.forEach((command, index) => {
+      const evidence = {
+        argv: command.argv,
+        cwd: command.cwd,
+        purpose: command.purpose,
+        exit_code: command.exit_code,
+        elapsed_seconds: command.elapsed_seconds,
+        stdout: command.stdout,
+        stderr: command.stderr,
+        output_truncated: Boolean(command.stdout_truncated || command.stderr_truncated),
+      };
+      appendEvidenceBlock(commandList, `命令 ${index + 1} · exit ${command.exit_code}`, JSON.stringify(evidence, null, 2), "proof-command");
+    });
+  } else {
+    commandList.textContent = "没有执行本地命令。";
+  }
+
+  const warning = node.querySelector(".proof-warning");
+  warning.hidden = proof.shell_side_effects_unknown !== true;
+  warning.textContent = "本次运行执行过命令；回滚只覆盖 TraceCoder 文件工具的修改，不能撤销命令产生的任意副作用。";
+  const message = node.querySelector(".transaction-message");
+  message.textContent = ({
+    pending: "修改尚未确认：你可以接受或回滚。开始下一轮对话会自动接受本轮修改。",
+    accepted: "修改已接受，事务快照已关闭。",
+    rolled_back: "文件工具产生的修改已回滚。",
+    not_required: "本轮没有需要回滚的文件工具修改。",
+  })[transactionState] || `事务状态：${transactionState}`;
+
+  const accept = node.querySelector(".proof-accept");
+  const rollback = node.querySelector(".proof-rollback");
+  accept.hidden = !rollbackAvailable;
+  rollback.hidden = !rollbackAvailable;
+  accept.disabled = false;
+  rollback.disabled = false;
+  const download = node.querySelector(".proof-download");
+  download.href = `/api/runs/${runId}/proof.md`;
+  download.setAttribute("download", `tracecoder-proof-${runId}.md`);
+}
+
+async function resolveTransaction(runId, action, node) {
+  const accept = node.querySelector(".proof-accept");
+  const rollback = node.querySelector(".proof-rollback");
+  accept.disabled = true;
+  rollback.disabled = true;
+  try {
+    const snapshot = await request(`/api/runs/${runId}/transaction`, {
+      method: "POST",
+      body: JSON.stringify({ action }),
+    });
+    fillProofNode(runId, node, snapshot.result);
+    elements.runtimeLabel.textContent = action === "rollback" ? "修改已回滚" : "修改已接受";
+  } catch (error) {
+    accept.disabled = false;
+    rollback.disabled = false;
+    elements.runtimeLabel.textContent = `事务操作失败：${error.message}`;
+  }
+}
+
+function renderProof(runId, result) {
+  if (!result?.proof) return;
+  let node = state.proofNodes.get(runId);
+  if (!node) {
+    node = document.querySelector("#proof-template").content.firstElementChild.cloneNode(true);
+    node.querySelector(".proof-accept").addEventListener("click", () => { void resolveTransaction(runId, "accept", node); });
+    node.querySelector(".proof-rollback").addEventListener("click", () => { void resolveTransaction(runId, "rollback", node); });
+    state.proofNodes.set(runId, node);
+    elements.timeline.appendChild(node);
+  }
+  fillProofNode(runId, node, result);
+  scrollToBottom();
+}
+
 function appendTurn(snapshot) {
   appendMessage("user", snapshot.task, snapshot.attachments || []);
   renderProcessEvents(snapshot.id, snapshot.events || [], snapshot);
-  if (TERMINAL_STATUSES.has(snapshot.status)) renderFinalAnswer(snapshot.id, snapshot.result, snapshot.error);
+  if (TERMINAL_STATUSES.has(snapshot.status)) {
+    renderFinalAnswer(snapshot.id, snapshot.result, snapshot.error);
+    renderProof(snapshot.id, snapshot.result);
+  }
 }
 
 function renderConversation(conversation) {
@@ -259,6 +383,8 @@ function updateControls() {
   elements.input.disabled = state.running;
   elements.attach.disabled = blocked;
   elements.fileInput.disabled = blocked;
+  elements.repairPreset.disabled = blocked;
+  elements.generatePreset.disabled = blocked;
   elements.cancel.disabled = !state.running;
   elements.run.textContent = state.running ? "…" : "↑";
 }
@@ -366,6 +492,7 @@ async function pollingLoop(generation) {
       if (state.conversationId === data.conversation_id && state.runId === runId) {
         updateApproval(null);
         renderFinalAnswer(runId, data.result, data.error);
+        renderProof(runId, data.result);
       }
       return;
     }
@@ -398,6 +525,8 @@ async function selectConversation(conversationId) {
   try {
     const conversation = await request(`/api/conversations/${conversationId}`);
     if (navigationGeneration !== state.navigationGeneration) return;
+    state.scenario = "general";
+    elements.scenarioLabel.hidden = true;
     renderConversation(conversation);
     const latest = conversation.turns?.at(-1) || null;
     if (!latest || TERMINAL_STATUSES.has(latest.status)) {
@@ -500,6 +629,7 @@ elements.form.addEventListener("submit", async (event) => {
         task,
         attachments: state.attachments.map((attachment) => attachment.path),
         conversation_id: state.conversationId,
+        scenario: state.scenario,
       }),
     });
     const continuingVisibleConversation = state.conversationId === started.conversation_id;
@@ -517,6 +647,8 @@ elements.form.addEventListener("submit", async (event) => {
     upsertConversation(started);
     elements.input.value = "";
     state.attachments = [];
+    state.scenario = "general";
+    elements.scenarioLabel.hidden = true;
     renderAttachments();
     resetComposerHeight();
     if (TERMINAL_STATUSES.has(started.status)) {
@@ -552,6 +684,24 @@ elements.input.addEventListener("keydown", (event) => {
 elements.attach.addEventListener("click", () => elements.fileInput.click());
 elements.fileInput.addEventListener("change", () => { void uploadFiles(Array.from(elements.fileInput.files || [])); });
 
+function chooseScenario(scenario) {
+  if (state.running) return;
+  state.scenario = scenario;
+  elements.scenarioLabel.hidden = false;
+  if (scenario === "repair") {
+    elements.scenarioLabel.textContent = "场景：课程项目修复";
+    if (!elements.input.value.trim()) elements.input.value = "请检查并修复当前课程项目中的问题：\n";
+  } else {
+    elements.scenarioLabel.textContent = "场景：小型项目生成";
+    if (!elements.input.value.trim()) elements.input.value = "课题：\n目标目录：course_project\n功能要求：";
+  }
+  resetComposerHeight();
+  elements.input.focus();
+}
+
+elements.repairPreset.addEventListener("click", () => chooseScenario("repair"));
+elements.generatePreset.addEventListener("click", () => chooseScenario("generate"));
+
 elements.newChat.addEventListener("click", () => {
   if (state.running) {
     elements.runtimeLabel.textContent = "当前任务仍在运行，请先停止或等待完成";
@@ -562,6 +712,8 @@ elements.newChat.addEventListener("click", () => {
   state.conversationId = null;
   state.runId = null;
   state.attachments = [];
+  state.scenario = "general";
+  elements.scenarioLabel.hidden = true;
   renderAttachments();
   resetTimeline();
   renderHistory();

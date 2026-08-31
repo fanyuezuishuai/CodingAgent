@@ -9,6 +9,17 @@ import pytest
 from tracecoder.trace import TraceFormatError, TraceRecorder, read_trace
 
 
+@pytest.mark.parametrize("session_id", ["../escape", "bad/name", "", "."])
+def test_trace_rejects_unsafe_session_id_before_creating_artifacts(
+    tmp_path: Path,
+    session_id: str,
+) -> None:
+    with pytest.raises(ValueError, match="session_id"):
+        TraceRecorder(tmp_path, session_id=session_id)
+
+    assert not (tmp_path / ".tracecoder").exists()
+
+
 def test_trace_is_jsonl_and_redacts_secrets(tmp_path: Path) -> None:
     recorder = TraceRecorder(tmp_path, secrets=["sentinel-secret"], session_id="session-test")
 
