@@ -4,10 +4,12 @@ import json
 import sys
 from pathlib import Path
 
-from tests.fakes import FakeModelClient
+import pytest
+
+from tests.fakes import FakeModelClient, plan_call
 from tracecoder.agent import Agent
 from tracecoder.context import ContextManager
-from tracecoder.domain import ModelReply, TerminationReason, ToolCall, VerificationStatus
+from tracecoder.domain import JSONValue, ModelReply, TerminationReason, ToolCall, VerificationStatus
 from tracecoder.tools import build_tool_registry
 from tracecoder.trace import TraceRecorder, read_trace
 from tracecoder.transaction import WorkspaceTransaction
@@ -37,10 +39,12 @@ def _agent(
 
 def test_fake_model_can_edit_verify_and_complete(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    steps = ["Update app.py", "Verify app.py"]
     replies = [
         ModelReply(tool_calls=(ToolCall("read", "read_file", {"path": "app.py"}),)),
         ModelReply(
             tool_calls=(
+                plan_call("plan-edit", steps),
                 ToolCall(
                     "write",
                     "replace_text",
@@ -70,10 +74,366 @@ def test_fake_model_can_edit_verify_and_complete(tmp_path: Path) -> None:
     assert result.verification_status is VerificationStatus.COMMAND_PASSED
     assert result.changed_files == ("app.py",)
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "value = 2\n"
+    assert len(model.requests) == 4
     assert any(message.get("tool_call_id") == "verify" for message in model.requests[-1])
     events = read_trace(trace.path)
     assert events[-1]["event_type"] == "run_finished"
     assert events[-1]["payload"]["reason"] == "completed"
+    phase_changes = [event["payload"]["to"] for event in events if event["event_type"] == "phase_changed"]
+    assert phase_changes[-2:] == ["verify", "complete"]
+
+
+def test_mutation_without_an_explicit_plan_is_blocked(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    replies = [
+        ModelReply(
+            tool_calls=(
+                ToolCall(
+                    "write",
+                    "write_file",
+                    {"path": "app.py", "content": "value = 2\n", "overwrite": True},
+                ),
+            )
+        ),
+        ModelReply(content="I did not modify the file."),
+        ModelReply(content="I still cannot establish and complete a plan."),
+    ]
+    agent, model, _trace = _agent(tmp_path, replies)
+
+    result = agent.run("Change the value to 2")
+
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+    assert result.changed_files == ()
+    assert result.termination_reason is TerminationReason.PLAN_FAILED
+    visible_names = {tool["function"]["name"] for tool in model.tool_requests[0]}
+    assert "update_plan" in visible_names
+    tool_messages = [message for message in model.requests[1] if message.get("role") == "tool"]
+    assert json.loads(str(tool_messages[0]["content"]))["error_code"] == "plan_required"
+
+
+def test_run_command_requires_a_plan_even_when_declared_as_verification(tmp_path: Path) -> None:
+    replies = [
+        ModelReply(
+            tool_calls=(
+                ToolCall(
+                    "verify",
+                    "run_command",
+                    {"argv": [sys.executable, "-c", "print('not executed')"], "purpose": "verify"},
+                ),
+            )
+        ),
+        ModelReply(content="I did not run the command."),
+        ModelReply(content="I still cannot establish and complete a plan."),
+    ]
+    agent, model, _trace = _agent(tmp_path, replies)
+
+    result = agent.run("Run a verification command")
+
+    assert result.verification_status is VerificationStatus.NOT_REQUIRED
+    assert result.termination_reason is TerminationReason.PLAN_FAILED
+    tool_messages = [message for message in model.requests[1] if message.get("role") == "tool"]
+    assert json.loads(str(tool_messages[0]["content"]))["error_code"] == "plan_required"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"steps": []},
+        {"steps": [f"Step {index}" for index in range(9)]},
+        {"steps": ["  "]},
+        {"steps": [1]},
+        {"steps": ["Write app.py"], "extra": True},
+    ],
+    ids=["empty", "too-many", "blank", "non-string", "unknown-key"],
+)
+def test_invalid_plan_blocks_following_mutation(
+    tmp_path: Path,
+    arguments: dict[str, JSONValue],
+) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    replies = [
+        ModelReply(
+            tool_calls=(
+                ToolCall("bad-plan", "update_plan", arguments),
+                ToolCall("write", "write_file", {"path": "app.py", "content": "value = 2\n"}),
+            )
+        ),
+        ModelReply(content="Done."),
+        ModelReply(content="I cannot provide a valid plan."),
+    ]
+    agent, model, _trace = _agent(tmp_path, replies)
+
+    result = agent.run("Change the value to 2")
+
+    assert result.termination_reason is TerminationReason.PLAN_FAILED
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+    tool_messages = [message for message in model.requests[1] if message.get("role") == "tool"]
+    payloads = [json.loads(str(message["content"])) for message in tool_messages]
+    assert [payload["error_code"] for payload in payloads] == ["invalid_plan", "plan_update_failed"]
+
+
+def test_one_replan_can_recover_and_tool_results_are_linked_to_plan_steps(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    initial_steps = ["Update app.py", "Verify app.py"]
+    revised_steps = ["Correct app.py using observed content", "Verify the correction"]
+    replies = [
+        ModelReply(
+            tool_calls=(
+                plan_call("plan-1", initial_steps),
+                ToolCall("bad-edit", "replace_text", {"path": "app.py", "old": "missing", "new": "2"}),
+            )
+        ),
+        ModelReply(
+            tool_calls=(
+                plan_call("plan-2", revised_steps),
+                ToolCall("good-edit", "replace_text", {"path": "app.py", "old": "1", "new": "2"}),
+            )
+        ),
+        ModelReply(
+            tool_calls=(
+                ToolCall(
+                    "verify",
+                    "run_command",
+                    {"argv": [sys.executable, "-c", "raise SystemExit(0)"], "purpose": "verify"},
+                ),
+            )
+        ),
+        ModelReply(content="Updated and verified app.py."),
+    ]
+    agent, _model, trace = _agent(tmp_path, replies)
+
+    result = agent.run("Change the value to 2")
+
+    assert result.successful
+    assert target.read_text(encoding="utf-8") == "value = 2\n"
+    events = read_trace(trace.path)
+    plan_updates = [event for event in events if event["event_type"] == "plan_updated"]
+    assert [event["payload"]["kind"] for event in plan_updates] == ["created", "replanned"]
+    tool_results = {
+        event["payload"]["tool_call_id"]: event["payload"]
+        for event in events
+        if event["event_type"] == "tool_result"
+    }
+    assert tool_results["bad-edit"]["plan_version"] == 1
+    assert tool_results["bad-edit"]["plan_step"] == 1
+    assert tool_results["good-edit"]["plan_version"] == 2
+    assert tool_results["good-edit"]["plan_step"] == 1
+    assert tool_results["verify"]["plan_step"] == 2
+
+
+def test_rejected_action_does_not_destroy_pending_replan_state(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    replies = [
+        ModelReply(
+            tool_calls=(
+                plan_call("plan-1", ["Attempt edit"]),
+                ToolCall("bad-edit", "replace_text", {"path": "app.py", "old": "missing", "new": "2"}),
+            )
+        ),
+        ModelReply(
+            tool_calls=(
+                ToolCall("out-of-order", "write_file", {"path": "app.py", "content": "value = 3\n"}),
+            )
+        ),
+        ModelReply(
+            tool_calls=(
+                plan_call("plan-2", ["Correct app.py", "Verify app.py"]),
+                ToolCall("good-edit", "replace_text", {"path": "app.py", "old": "1", "new": "2"}),
+            )
+        ),
+        ModelReply(
+            tool_calls=(
+                ToolCall(
+                    "verify",
+                    "run_command",
+                    {"argv": [sys.executable, "-c", "raise SystemExit(0)"], "purpose": "verify"},
+                ),
+            )
+        ),
+        ModelReply(content="Updated and verified app.py."),
+    ]
+    agent, model, trace = _agent(tmp_path, replies)
+
+    result = agent.run("Change the value to 2")
+
+    assert result.successful
+    assert target.read_text(encoding="utf-8") == "value = 2\n"
+    out_of_order_results = [
+        message
+        for message in model.requests[2]
+        if message.get("role") == "tool" and message.get("tool_call_id") == "out-of-order"
+    ]
+    assert json.loads(str(out_of_order_results[0]["content"]))["error_code"] == "replan_required"
+    phase_changes = [event["payload"]["to"] for event in read_trace(trace.path) if event["event_type"] == "phase_changed"]
+    assert phase_changes.count("replan") == 1
+
+
+def test_batch_failure_aborts_later_actions_and_allows_one_replan(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    replies = [
+        ModelReply(
+            tool_calls=(
+                plan_call("plan-1", ["Apply the edit batch"]),
+                ToolCall("first-write", "write_file", {"path": "app.py", "content": "value = 2\n"}),
+                ToolCall("failed-edit", "replace_text", {"path": "app.py", "old": "missing", "new": "3"}),
+                ToolCall("must-abort", "write_file", {"path": "app.py", "content": "value = 99\n"}),
+            )
+        ),
+        ModelReply(
+            tool_calls=(
+                plan_call("plan-2", ["Correct app.py from observed state", "Verify app.py"]),
+                ToolCall("recover", "replace_text", {"path": "app.py", "old": "2", "new": "4"}),
+            )
+        ),
+        ModelReply(
+            tool_calls=(
+                ToolCall(
+                    "verify",
+                    "run_command",
+                    {"argv": [sys.executable, "-c", "raise SystemExit(0)"], "purpose": "verify"},
+                ),
+            )
+        ),
+        ModelReply(content="Recovered and verified app.py."),
+    ]
+    agent, model, trace = _agent(tmp_path, replies)
+
+    result = agent.run("Change the value safely")
+
+    assert result.successful
+    assert target.read_text(encoding="utf-8") == "value = 4\n"
+    tool_messages = [message for message in model.requests[1] if message.get("role") == "tool"]
+    aborted = next(message for message in tool_messages if message.get("tool_call_id") == "must-abort")
+    assert json.loads(str(aborted["content"]))["error_code"] == "action_batch_aborted"
+    failed_steps = [event for event in read_trace(trace.path) if event["event_type"] == "plan_step_failed"]
+    assert len(failed_steps) == 1
+
+
+def test_second_failure_after_the_only_replan_is_terminal(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    replies = [
+        ModelReply(
+            tool_calls=(
+                plan_call("plan-1", ["Attempt edit"]),
+                ToolCall("bad-1", "replace_text", {"path": "app.py", "old": "missing-1", "new": "2"}),
+            )
+        ),
+        ModelReply(
+            tool_calls=(
+                plan_call("plan-2", ["Retry corrected edit"]),
+                ToolCall("bad-2", "replace_text", {"path": "app.py", "old": "missing-2", "new": "2"}),
+            )
+        ),
+    ]
+    agent, model, trace = _agent(tmp_path, replies)
+
+    result = agent.run("Change the value to 2")
+
+    assert result.termination_reason is TerminationReason.PLAN_FAILED
+    assert result.steps == 2
+    assert len(model.requests) == 2
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+    assert read_trace(trace.path)[-1]["payload"]["reason"] == "plan_failed"
+
+
+def test_incomplete_plan_cannot_finish_as_completed(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    steps = ["Update app.py", "Verify app.py"]
+    replies = [
+        ModelReply(
+            tool_calls=(
+                plan_call("plan", steps),
+                ToolCall("write", "write_file", {"path": "app.py", "content": "value = 2\n"}),
+            )
+        ),
+        ModelReply(content="Done."),
+        ModelReply(content="I cannot complete the remaining plan step."),
+    ]
+    agent, model, _trace = _agent(tmp_path, replies)
+
+    result = agent.run("Change the value to 2")
+
+    assert result.termination_reason is TerminationReason.PLAN_FAILED
+    assert len(model.requests) == 3
+    assert any("plan" in str(message.get("content", "")).lower() for message in model.requests[-1])
+
+
+def test_plan_and_verification_completion_reminders_are_independent(tmp_path: Path) -> None:
+    target = tmp_path / "note.txt"
+    target.write_text("old", encoding="utf-8")
+    replies = [
+        ModelReply(tool_calls=(plan_call("plan", ["Update note.txt"]),)),
+        ModelReply(content="Done before executing the plan."),
+        ModelReply(
+            tool_calls=(
+                ToolCall("write", "write_file", {"path": "note.txt", "content": "new"}),
+            )
+        ),
+        ModelReply(content="Done without verification."),
+        ModelReply(content="I cannot run verification."),
+    ]
+    agent, model, _trace = _agent(tmp_path, replies)
+
+    result = agent.run("Update the note")
+
+    assert result.termination_reason is TerminationReason.COMPLETED
+    assert result.verification_status is VerificationStatus.REQUIRED
+    assert target.read_text(encoding="utf-8") == "new"
+    assert len(model.requests) == 5
+    assert any("plan" in str(message.get("content", "")).lower() for message in model.requests[2])
+    assert any("verification" in str(message.get("content", "")).lower() for message in model.requests[4])
+
+
+def test_verification_command_requires_an_active_plan_step(tmp_path: Path) -> None:
+    target = tmp_path / "note.txt"
+    target.write_text("old", encoding="utf-8")
+    command_output = tmp_path / "verification-command-ran.txt"
+    replies = [
+        ModelReply(
+            tool_calls=(
+                plan_call("plan", ["Update note.txt"]),
+                ToolCall("write", "write_file", {"path": "note.txt", "content": "new"}),
+            )
+        ),
+        ModelReply(
+            tool_calls=(
+                ToolCall(
+                    "verify-outside-plan",
+                    "run_command",
+                    {
+                        "argv": [
+                            sys.executable,
+                            "-c",
+                            "from pathlib import Path; Path('verification-command-ran.txt').write_text('ran')",
+                        ],
+                        "purpose": "verify",
+                    },
+                ),
+            )
+        ),
+        ModelReply(content="Done."),
+        ModelReply(content="I cannot run a planned verification."),
+    ]
+    agent, model, _trace = _agent(tmp_path, replies)
+
+    result = agent.run("Update the note")
+
+    assert result.termination_reason is TerminationReason.COMPLETED
+    assert result.verification_status is VerificationStatus.REQUIRED
+    assert not command_output.exists()
+    tool_messages = [
+        message
+        for message in model.requests[2]
+        if message.get("role") == "tool" and message.get("tool_call_id") == "verify-outside-plan"
+    ]
+    assert json.loads(str(tool_messages[0]["content"]))["error_code"] == "plan_step_required"
 
 
 def test_read_only_tool_policy_hides_and_blocks_mutating_tools(tmp_path: Path) -> None:
@@ -97,7 +457,7 @@ def test_read_only_tool_policy_hides_and_blocks_mutating_tools(tmp_path: Path) -
     result = agent.run("Plan the change without modifying files")
 
     visible_names = {tool["function"]["name"] for tool in model.tool_requests[0]}
-    assert visible_names == {"list_files", "search_text", "read_file"}
+    assert visible_names == {"update_plan", "list_files", "search_text", "read_file"}
     assert target.read_text(encoding="utf-8") == "value = 1\n"
     tool_messages = [message for message in model.requests[1] if message.get("role") == "tool"]
     assert "tool_not_allowed" in str(tool_messages[0]["content"])
@@ -106,10 +466,12 @@ def test_read_only_tool_policy_hides_and_blocks_mutating_tools(tmp_path: Path) -
 
 def test_proof_mode_records_diff_command_evidence_and_local_exports(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    steps = ["Update app.py", "Verify app.py"]
     model = FakeModelClient(
         [
             ModelReply(
                 tool_calls=(
+                    plan_call("plan-edit", steps),
                     ToolCall("edit", "replace_text", {"path": "app.py", "old": "1", "new": "2"}),
                 )
             ),
@@ -277,7 +639,12 @@ def test_agent_replays_complete_reasoning_history_after_cross_turn_compaction(
 def test_unverified_mutation_gets_one_reminder_then_finishes(tmp_path: Path) -> None:
     (tmp_path / "note.txt").write_text("old", encoding="utf-8")
     replies = [
-        ModelReply(tool_calls=(ToolCall("write", "write_file", {"path": "note.txt", "content": "new"}),)),
+        ModelReply(
+            tool_calls=(
+                plan_call("plan", ["Update note.txt"]),
+                ToolCall("write", "write_file", {"path": "note.txt", "content": "new"}),
+            )
+        ),
         ModelReply(content="Done."),
         ModelReply(content="I cannot run verification."),
     ]
@@ -295,6 +662,7 @@ def test_created_directory_requires_verification(tmp_path: Path) -> None:
     replies = [
         ModelReply(
             tool_calls=(
+                plan_call("plan", ["Create the project directory"]),
                 ToolCall("mkdir", "create_directory", {"path": "course_project"}),
             )
         ),
@@ -369,8 +737,14 @@ def test_secret_is_redacted_before_tool_result_reaches_model(tmp_path: Path) -> 
 
 def test_later_mutation_invalidates_prior_verification(tmp_path: Path) -> None:
     (tmp_path / "value.txt").write_text("one", encoding="utf-8")
+    steps = ["Write the first value", "Verify the first value", "Write the final value"]
     replies = [
-        ModelReply(tool_calls=(ToolCall("write-1", "write_file", {"path": "value.txt", "content": "two"}),)),
+        ModelReply(
+            tool_calls=(
+                plan_call("plan-write-1", steps),
+                ToolCall("write-1", "write_file", {"path": "value.txt", "content": "two"}),
+            )
+        ),
         ModelReply(
             tool_calls=(
                 ToolCall(
@@ -380,7 +754,11 @@ def test_later_mutation_invalidates_prior_verification(tmp_path: Path) -> None:
                 ),
             )
         ),
-        ModelReply(tool_calls=(ToolCall("write-2", "write_file", {"path": "value.txt", "content": "three"}),)),
+        ModelReply(
+            tool_calls=(
+                ToolCall("write-2", "write_file", {"path": "value.txt", "content": "three"}),
+            )
+        ),
         ModelReply(content="Done."),
         ModelReply(content="No further verification available."),
     ]

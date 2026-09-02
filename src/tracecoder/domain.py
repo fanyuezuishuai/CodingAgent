@@ -78,6 +78,17 @@ class VerificationStatus(StrEnum):
     COMMAND_FAILED = "verify_command_failed"
 
 
+class AgentPhase(StrEnum):
+    """Explicit phases of the bounded single-agent orchestration state machine."""
+
+    PLAN = "plan"
+    EXECUTE = "execute"
+    REPLAN = "replan"
+    VERIFY = "verify"
+    COMPLETE = "complete"
+    FAILED = "failed"
+
+
 class TerminationReason(StrEnum):
     """Deterministic reasons for leaving the agent loop."""
 
@@ -86,6 +97,7 @@ class TerminationReason(StrEnum):
     REPEATED_CALL = "repeated_call"
     PROVIDER_ERROR = "provider_error"
     INTERRUPTED = "interrupted"
+    PLAN_FAILED = "plan_failed"
 
 
 @dataclass(frozen=True, slots=True)

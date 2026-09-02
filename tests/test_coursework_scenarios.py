@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.fakes import FakeModelClient
+from tests.fakes import FakeModelClient, plan_call
 from tracecoder.agent import Agent
 from tracecoder.context import ContextManager
 from tracecoder.domain import ModelReply, ToolCall, VerificationStatus
@@ -52,10 +52,12 @@ def test_coursework_repair_scenario_fixes_verifies_proves_and_rolls_back(tmp_pat
         "        self.assertEqual(add(2, 3), 5)\n",
         encoding="utf-8",
     )
+    steps = ["Fix calculator.py", "Run the coursework test"]
     replies = [
         ModelReply(tool_calls=(ToolCall("inspect", "read_file", {"path": "course_project/calculator.py"}),)),
         ModelReply(
             tool_calls=(
+                plan_call("plan-fix", steps),
                 ToolCall(
                     "fix",
                     "replace_text",
@@ -114,13 +116,25 @@ def test_small_project_generation_creates_runnable_tested_project_and_rolls_back
             "        self.assertEqual(add(2, 3), 5)\n"
         ),
     }
+    steps = ["Create the project root", "Create the test directory", "Write project files", "Run tests"]
     replies = [
-        ModelReply(tool_calls=(ToolCall("root", "create_directory", {"path": "course_project"}),)),
-        ModelReply(tool_calls=(ToolCall("tests", "create_directory", {"path": "course_project/tests"}),)),
         ModelReply(
-            tool_calls=tuple(
-                ToolCall(f"write-{index}", "write_file", {"path": path, "content": content})
-                for index, (path, content) in enumerate(files.items(), start=1)
+            tool_calls=(
+                plan_call("plan-root", steps),
+                ToolCall("root", "create_directory", {"path": "course_project"}),
+            )
+        ),
+        ModelReply(
+            tool_calls=(
+                ToolCall("tests", "create_directory", {"path": "course_project/tests"}),
+            )
+        ),
+        ModelReply(
+            tool_calls=(
+                *(
+                    ToolCall(f"write-{index}", "write_file", {"path": path, "content": content})
+                    for index, (path, content) in enumerate(files.items(), start=1)
+                ),
             )
         ),
         ModelReply(

@@ -1,7 +1,14 @@
+TraceCoder
+
 Git 仓库：https://github.com/fanyuezuishuai/CodingAgent
 
-运行：安装 Python 3.11+，创建虚拟环境并执行 `python -m pip install -e ".[dev]"`。在工作区 `.env` 中配置 TRACECODER_API_KEY、TRACECODER_BASE_URL、TRACECODER_MODEL；同名进程环境变量覆盖 `.env`。CLI：`tracecoder run "编程任务" --workspace .`。GUI：`tracecoder web --workspace .`，浏览器访问 `http://127.0.0.1:8765`。Codespaces 配置个人 Secrets 后运行 `tracecoder web --workspace . --host 0.0.0.0 --trust-proxy-auth`。
+如何运行：需要 Python 3.11+。克隆仓库后执行：
+`python -m venv .venv`
+Windows 激活：`.\.venv\Scripts\Activate.ps1`
+Linux/macOS 激活：`source .venv/bin/activate`
+安装：`python -m pip install -e ".[dev]"`
+在目标工作区的 `.env` 中配置 `TRACECODER_API_KEY`、`TRACECODER_BASE_URL`、`TRACECODER_MODEL`。启动 Web：`tracecoder web --workspace .`，浏览器访问 `http://127.0.0.1:8765`；运行 CLI：`tracecoder run "编程任务" --workspace .`。
 
-特色：未使用 Agent 框架。自行实现 tool calling 解析、多轮历史与上下文压缩、DeepSeek 思考状态回传、七个本地工具、参数校验、有界循环、命令审批、路径隔离及脱敏 JSONL 轨迹。Proof Mode 依据真实 Diff 与验证状态导出证据；文件修改可接受或回滚。Web GUI 支持 Markdown、上传、折叠过程、可读审批、左右 Diff，以及可上传现有代码或从零开始的项目容器；项目内多对话归组并共享上下文，创建后自动进行只读规划并等待批准。GitHub Actions 在 Windows/Linux 自动测试。
+特色功能：项目未依赖 LangChain、LangGraph 等 Agent 框架，核心编排自行实现为有界的单智能体 Plan–Execute–Replan–Verify 状态机。修改文件或执行命令前必须建立显式计划，执行结果关联计划步骤，失败最多重规划一次，并保留最大步数、重复调用和验证终止门槛。Agent 可浏览、搜索、读取和直接修改本地文件；命令执行需审批。Web GUI 支持多轮对话、过程展示、代码 Diff、文件上传、项目归组，以及“先给方案、批准后落地”的项目流程。系统还提供路径隔离、参数校验、脱敏 JSONL 轨迹、基于真实 Diff 的 Proof 证据和文件改动接受/回滚。
 
-安全说明：`.env` 已忽略且对模型文件工具保留，仓库不含 key。文件工具不能越出工作区；命令默认逐次确认但并非系统沙箱；回滚只覆盖文件工具，不能保证撤销命令副作用。源码和命令输出会发送到所配置的模型提供方。`--trust-proxy-auth` 不提供认证，Codespaces 端口须保持 Private。
+说明：命令审批不等于系统沙箱；回滚仅覆盖文件工具产生的修改，不能保证撤销命令副作用。源码和命令输出会发送给所配置的模型提供方。

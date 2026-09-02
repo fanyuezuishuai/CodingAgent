@@ -9,7 +9,7 @@ from typing import Any, Protocol, cast
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.fakes import FakeModelClient
+from tests.fakes import FakeModelClient, plan_call
 from tracecoder.agent import Agent
 from tracecoder.config import Settings
 from tracecoder.context import ContextManager
@@ -675,6 +675,7 @@ def test_uploaded_file_is_readable_and_writable_by_real_agent(tmp_path: Path) ->
                 ),
                 ModelReply(
                     tool_calls=(
+                        plan_call("plan-upload", ["Update the uploaded file"]),
                         ToolCall(
                             "write-upload",
                             "write_file",
@@ -776,7 +777,7 @@ def test_web_integrates_real_agent_trace_and_run_manager(tmp_path: Path) -> None
         payload = _wait_for_status(client, started.json()["id"], {"finished"})
 
     event_types = [event["event_type"] for event in payload["events"]]
-    assert event_types == ["run_started", "model_reply", "run_finished"]
+    assert event_types == ["run_started", "model_reply", "phase_changed", "run_finished"]
     assert payload["result"]["successful"] is True
 
 
@@ -1114,6 +1115,7 @@ def test_web_persists_control_events_to_the_real_agent_trace(tmp_path: Path) -> 
                 [
                     ModelReply(
                         tool_calls=(
+                            plan_call("plan", ["Run the requested command"]),
                             ToolCall("run", "run_command", {"argv": ["python", "-V"]}),
                         )
                     )

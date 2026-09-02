@@ -2,7 +2,13 @@
 
 from collections.abc import Sequence
 
-from tracecoder.domain import ModelReply
+from tracecoder.domain import ModelReply, ToolCall
+
+
+def plan_call(call_id: str, steps: list[str]) -> ToolCall:
+    """Build the agent-owned plan control call used by scripted model replies."""
+
+    return ToolCall(call_id, "update_plan", {"steps": steps})
 
 
 class FakeModelClient:
