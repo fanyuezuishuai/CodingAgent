@@ -457,11 +457,34 @@ def test_read_only_tool_policy_hides_and_blocks_mutating_tools(tmp_path: Path) -
     result = agent.run("Plan the change without modifying files")
 
     visible_names = {tool["function"]["name"] for tool in model.tool_requests[0]}
-    assert visible_names == {"update_plan", "list_files", "search_text", "read_file"}
+    assert visible_names == {"list_files", "search_text", "read_file"}
     assert target.read_text(encoding="utf-8") == "value = 1\n"
     tool_messages = [message for message in model.requests[1] if message.get("role") == "tool"]
     assert "tool_not_allowed" in str(tool_messages[0]["content"])
     assert result.changed_files == ()
+
+
+def test_read_only_planning_response_is_not_replaced_by_runtime_plan_guard(tmp_path: Path) -> None:
+    plan_text = "## 落地方案\n\n1. 完善成绩录入。\n2. 添加自动化测试。\n\n请批准后开始编码。"
+    replies = [
+        ModelReply(
+            tool_calls=(
+                plan_call("unexpected-runtime-plan", ["等待用户批准", "实现功能", "运行测试"]),
+            )
+        ),
+        ModelReply(content=plan_text),
+    ]
+    agent, model, trace = _agent(tmp_path, replies)
+    agent.set_tool_allowlist(("list_files", "search_text", "read_file"))
+
+    result = agent.run("Read the uploaded code and provide an implementation plan for approval")
+
+    assert result.termination_reason is TerminationReason.COMPLETED
+    assert result.final_text == plan_text
+    assert len(model.requests) == 2
+    tool_messages = [message for message in model.requests[1] if message.get("role") == "tool"]
+    assert "tool_not_allowed" in str(tool_messages[0]["content"])
+    assert not any(event["event_type"] == "completion_reminder" for event in read_trace(trace.path))
 
 
 def test_proof_mode_records_diff_command_evidence_and_local_exports(tmp_path: Path) -> None:

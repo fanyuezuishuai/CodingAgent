@@ -197,6 +197,8 @@ class Agent:
             if isinstance(function, dict) and function.get("name") == UPDATE_PLAN_TOOL:
                 continue
             registry_schemas.append(schema)
+        if self._tool_is_disallowed(UPDATE_PLAN_TOOL):
+            return registry_schemas
         return [UPDATE_PLAN_SCHEMA, *registry_schemas]
 
     def _tool_is_disallowed(self, name: str) -> bool:
@@ -381,7 +383,12 @@ class Agent:
                     perform_plan_update = False
                     execute_registry = False
                     if is_plan_control:
-                        if action_seen or plan_control_seen:
+                        if self._tool_is_disallowed(call.name):
+                            result = ToolResult.failure(
+                                "tool_not_allowed",
+                                f"Tool is disabled for this run: {call.name}",
+                            )
+                        elif action_seen or plan_control_seen:
                             result = ToolResult.failure(
                                 "plan_order_invalid",
                                 "Call update_plan once and before all action tools in the same reply.",
