@@ -56,7 +56,6 @@
           <div class="empty-state" id="empty-state">
             <div class="empty-mark">T</div>
             <h2 id="empty-title">今天想完成什么编程任务？</h2>
-            <p id="empty-description">TraceCoder 会在当前工作区内读取和修改文件；需要执行命令时会先请求你的批准。</p>
           </div>
         </div>
 
@@ -99,7 +98,6 @@
             <div>
               <p class="eyebrow">PROJECTS</p>
               <h1>项目</h1>
-              <p>把相关对话和代码文件放在同一个上下文中。</p>
             </div>
             <button class="primary-button" id="new-project-button" type="button">新建项目</button>
           </div>
@@ -112,7 +110,7 @@
             <span>名称</span><span>对话</span><span>修改时间</span>
           </div>
           <div class="project-list" id="project-list"></div>
-          <p class="project-empty" id="project-empty">还没有项目。新建一个项目，可以从零开始，也可以先上传现有代码。</p>
+          <p class="project-empty" id="project-empty">还没有项目。新建一个项目。</p>
         </div>
 
         <div class="project-detail" id="project-detail" hidden>
@@ -121,7 +119,6 @@
             <button class="primary-button" id="project-new-chat-button" type="button">＋ 新对话</button>
           </div>
           <div class="project-detail-copy">
-            <p class="eyebrow">项目共享上下文</p>
             <h1 id="project-detail-name"></h1>
             <p id="project-detail-goal"></p>
             <p class="project-detail-meta" id="project-detail-meta"></p>
@@ -138,7 +135,6 @@
           <div><p class="eyebrow">NEW PROJECT</p><h2>新建项目</h2></div>
           <button class="dialog-close" id="project-cancel-button" type="button" aria-label="关闭">×</button>
         </div>
-        <p class="dialog-intro">不需要选择“修复”或“生成”。告诉 TraceCoder 目标，有现有代码时直接上传即可。</p>
         <div class="project-form-grid" role="table" aria-label="项目信息">
           <label role="row"><span role="cell">项目名称 <b>*</b></span><input id="project-name" maxlength="80" required placeholder="例如：算法课程作业"></label>
           <label role="row"><span role="cell">项目目标 <b>*</b></span><textarea id="project-goal" rows="4" maxlength="4000" required placeholder="描述要完成的功能、需要修复的问题或验收条件"></textarea></label>
@@ -189,7 +185,7 @@
     <template id="proof-template">
       <article class="proof-card">
         <div class="proof-heading">
-          <div><span class="proof-badge">Proof Mode</span><strong>运行证据</strong></div>
+          <strong>变更摘要</strong>
           <span class="proof-status"></span>
         </div>
         <p class="proof-summary"></p>

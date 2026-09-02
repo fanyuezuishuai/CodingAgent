@@ -54,6 +54,7 @@ def test_web_serves_ui_and_public_configuration(tmp_path: Path) -> None:
         config = client.get("/api/config")
 
     assert page.status_code == 200
+    assert page.headers["cache-control"] == "no-store"
     assert "TraceCoder" in page.text
     assert 'id="model"' in page.text
     assert 'id="history-list"' in page.text
@@ -69,6 +70,12 @@ def test_web_serves_ui_and_public_configuration(tmp_path: Path) -> None:
     assert 'id="repair-preset"' not in page.text
     assert 'id="generate-preset"' not in page.text
     assert 'id="proof-template"' in page.text
+    assert "变更摘要" in page.text
+    assert "运行证据" not in page.text
+    assert "Proof Mode" not in page.text
+    assert "把相关对话和代码文件放在同一个上下文中" not in page.text
+    assert "项目共享上下文" not in page.text
+    assert "不需要选择“修复”或“生成”" not in page.text
     assert 'id="workspace"' not in page.text
     assert 'id="provider"' not in page.text
     assert config.json() == {
@@ -89,6 +96,10 @@ def test_web_ui_assets_keep_process_collapsed_and_composer_docked(tmp_path: Path
         markdown = client.get("/assets/markdown.js")
         styles = client.get("/assets/styles.css")
 
+    assert page.headers["cache-control"] == "no-store"
+    assert script.headers["cache-control"] == "no-store"
+    assert markdown.headers["cache-control"] == "no-store"
+    assert styles.headers["cache-control"] == "no-store"
     assert '<details class="process-card">' in page.text
     assert (
         page.text.index('id="model"')

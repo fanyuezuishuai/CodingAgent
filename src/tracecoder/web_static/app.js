@@ -42,7 +42,6 @@ const elements = {
   timeline: document.querySelector("#timeline"),
   empty: document.querySelector("#empty-state"),
   emptyTitle: document.querySelector("#empty-title"),
-  emptyDescription: document.querySelector("#empty-description"),
   approval: document.querySelector("#approval-card"),
   approvalDescription: document.querySelector("#approval-description"),
   approvalCwd: document.querySelector("#approval-cwd"),
@@ -172,13 +171,11 @@ function showProjectsPage() {
   elements.projectDetail.hidden = true;
 }
 
-function updateEmptyStateCopy() {
+function updateEmptyStateTitle() {
   if (state.projectId && state.activeProject) {
     elements.emptyTitle.textContent = `继续项目：${state.activeProject.name}`;
-    elements.emptyDescription.textContent = "这里的新对话会共享该项目已有对话上下文和上传文件。";
   } else {
     elements.emptyTitle.textContent = "今天想完成什么编程任务？";
-    elements.emptyDescription.textContent = "TraceCoder 会在当前工作区内读取和修改文件；需要执行命令时会先请求你的批准。";
   }
 }
 
@@ -186,7 +183,7 @@ function resetTimeline() {
   elements.timeline.replaceChildren(elements.empty);
   elements.empty.hidden = false;
   elements.title.textContent = state.activeProject?.name || "新对话";
-  updateEmptyStateCopy();
+  updateEmptyStateTitle();
   state.lastEventId = 0;
   state.processNodes = new Map();
   state.deferredProcessEvents = new Map();
@@ -417,7 +414,7 @@ function fillProofNode(runId, node, result) {
   node.querySelector(".proof-status").textContent = verification === "verify_command_passed"
     ? "验证命令通过（由模型选择）"
     : `验证：${verification}`;
-  node.querySelector(".proof-summary").textContent = `${changes.length} 个文件证据 · ${proof.steps || result?.steps || 0} 个模型步骤`;
+  node.querySelector(".proof-summary").textContent = `${changes.length} 个文件变更 · ${proof.steps || result?.steps || 0} 个处理步骤`;
 
   const files = node.querySelector(".proof-files");
   files.replaceChildren();

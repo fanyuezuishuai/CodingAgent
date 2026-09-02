@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 from _thread import LockType
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -1086,6 +1086,17 @@ def create_app(
     manager = RunManager(agent_factory, workspace=canonical_workspace)
     app = FastAPI(title="TraceCoder Local Web", docs_url=None, redoc_url=None)
     app.state.run_manager = manager
+
+    @app.middleware("http")
+    async def prevent_static_cache(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        response = await call_next(request)
+        if request.url.path == "/" or request.url.path.startswith("/assets/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
     app.mount("/assets", StaticFiles(directory=_STATIC_DIRECTORY), name="assets")
 
     @app.get("/", include_in_schema=False)

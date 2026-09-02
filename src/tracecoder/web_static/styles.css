@@ -184,7 +184,6 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .empty-state[hidden] { display: none; }
 .empty-mark { display: grid; width: 48px; height: 48px; margin-bottom: 18px; place-items: center; border: 1px solid #3b584d; border-radius: 16px; color: var(--accent); background: rgba(83, 201, 154, .08); font-weight: 900; }
 .empty-state h2 { margin: 0 0 10px; color: var(--text); font-size: 24px; letter-spacing: -.03em; }
-.empty-state p { max-width: 560px; margin: 0; line-height: 1.65; }
 
 .projects-view {
   min-width: 0;
@@ -229,7 +228,6 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .dialog-heading h2 { margin: 3px 0 0; font-size: 24px; }
 .dialog-close { width: 34px; height: 34px; border: 0; border-radius: 9px; color: var(--muted); background: transparent; font-size: 24px; }
 .dialog-close:hover { color: var(--text); background: var(--panel-soft); }
-.dialog-intro { margin: 15px 0 22px; color: var(--muted); font-size: 12px; line-height: 1.6; }
 .project-form-grid { overflow: hidden; border: 1px solid var(--border); border-radius: 13px; }
 .project-form-grid > label, .project-upload-row { display: grid; grid-template-columns: 128px minmax(0, 1fr); border-bottom: 1px solid var(--border); }
 .project-form-grid > :last-child { border-bottom: 0; }
@@ -308,10 +306,9 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .process-event.error .process-content { color: #ffc3c8; }
 
 .proof-card { margin: 0 0 24px; padding: 16px; border: 1px solid #315044; border-radius: 14px; background: rgba(19, 35, 29, .58); }
-.proof-heading, .proof-heading > div, .proof-actions { display: flex; align-items: center; gap: 10px; }
+.proof-heading, .proof-actions { display: flex; align-items: center; gap: 10px; }
 .proof-heading { justify-content: space-between; }
 .proof-heading strong { font-size: 13px; }
-.proof-badge { padding: 4px 7px; border-radius: 6px; color: #06110c; background: var(--accent); font-size: 9px; font-weight: 900; letter-spacing: .04em; text-transform: uppercase; }
 .proof-status { color: #a9ebd0; font-size: 11px; }
 .proof-summary, .transaction-message { margin: 11px 0; color: var(--muted); font-size: 11px; }
 .proof-details { border-top: 1px solid rgba(83, 201, 154, .2); border-bottom: 1px solid rgba(83, 201, 154, .2); }

@@ -126,7 +126,7 @@ function proofTemplate() {
 
 const selectors = [
   "#task-form", "#task-input", "#run-button", "#cancel-button", "#timeline", "#empty-state",
-  "#empty-title", "#empty-description",
+  "#empty-title",
   "#approval-card", "#approval-description", "#approval-cwd", "#approval-command", ".exact-command",
   "#approve-button", "#deny-button", "#runtime-label", "#model", "#conversation-title", "#history-list",
   "#history-empty", "#new-chat-button", "#attach-button", "#file-input", "#attachment-list", "#upload-status",
@@ -344,7 +344,7 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
   assert.equal(process.open, false);
   const proof = elements["#timeline"].children.find((node) => node.classList.contains("proof-card"));
   assert.ok(proof);
-  assert.match(proof.querySelector(".proof-summary").textContent, /1 个文件证据/);
+  assert.match(proof.querySelector(".proof-summary").textContent, /1 个文件变更/);
   assert.equal(proof.querySelector(".proof-commands"), null);
   const diffDetails = proof.querySelector(".proof-files").children[0];
   assert.equal(diffDetails.children.length, 1);
