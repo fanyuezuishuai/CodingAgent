@@ -21,7 +21,7 @@ from tracecoder.evidence import build_proof, command_evidence, write_proof_artif
 from tracecoder.llm.base import ModelClient
 from tracecoder.tools.registry import ToolRegistry
 from tracecoder.trace import TraceRecorder
-from tracecoder.transaction import WorkspaceTransaction
+from tracecoder.transaction import TransactionError, WorkspaceTransaction
 
 SYSTEM_PROMPT = """You are TraceCoder, a local coding agent.
 Inspect the workspace with tools before changing it. Make focused edits, handle tool errors, and use
@@ -62,12 +62,18 @@ class Agent:
         self._conversation_messages: list[Message] = []
         self._current_task = ""
         self._command_evidence: list[dict[str, JSONValue]] = []
+        self._allowed_tools: frozenset[str] | None = None
 
     @property
     def conversation_messages(self) -> tuple[Message, ...]:
         """Return reusable non-system messages from the latest run."""
 
         return tuple(dict(message) for message in _reusable_messages(self._conversation_messages))
+
+    def set_tool_allowlist(self, names: Sequence[str] | None) -> None:
+        """Restrict model-visible and executable tools for this isolated run."""
+
+        self._allowed_tools = frozenset(names) if names is not None else None
 
     def run(self, task: str, *, history: Sequence[Message] = ()) -> RunResult:
         """Run one task until a deterministic terminal condition is reached."""
@@ -107,7 +113,10 @@ class Agent:
                 runtime_summary = _runtime_summary(changed_files, verification, shell_side_effects_unknown, failures)
                 request_messages = self.context.prepare(messages, runtime_summary)
                 model_started = time.monotonic()
-                reply = self.model.complete(request_messages, self.registry.schemas_for_model())
+                reply = self.model.complete(
+                    request_messages,
+                    self.registry.schemas_for_model(self._allowed_tools),
+                )
                 model_elapsed = round(time.monotonic() - model_started, 4)
                 self.trace.record(
                     "model_reply",
@@ -128,7 +137,10 @@ class Agent:
                 messages.append(_assistant_message(reply))
 
                 if not reply.tool_calls:
-                    if verification in {VerificationStatus.REQUIRED, VerificationStatus.FAILED} and not reminder_sent:
+                    if verification in {
+                        VerificationStatus.REQUIRED,
+                        VerificationStatus.COMMAND_FAILED,
+                    } and not reminder_sent:
                         reminder_sent = True
                         messages.append({"role": "system", "content": VERIFICATION_REMINDER.strip()})
                         self.trace.record("verification_reminder", {"status": verification.value})
@@ -168,7 +180,11 @@ class Agent:
 
                     self.trace.record("tool_requested", {"step": steps, **_tool_call_payload(call)})
                     tool_started = time.monotonic()
-                    result = self.registry.execute(call.name, call.arguments)
+                    result = self.registry.execute(
+                        call.name,
+                        call.arguments,
+                        allowed_names=self._allowed_tools,
+                    )
                     tool_elapsed = round(time.monotonic() - tool_started, 4)
                     redacted_result = self.trace.redact(result.to_dict())
                     if isinstance(redacted_result, dict):
@@ -255,6 +271,14 @@ class Agent:
         shell_side_effects_unknown: bool,
     ) -> RunResult:
         safe_final_text = str(self.trace.redact(final_text))
+        if self.transaction is not None and self.transaction.state == "pending":
+            try:
+                self.transaction.seal()
+            except (OSError, TransactionError) as exc:
+                self.trace.record(
+                    "transaction_seal_failed",
+                    {"error": str(self.trace.redact(f"{type(exc).__name__}: {exc}"))},
+                )
         last_non_system = next(
             (message for message in reversed(self._conversation_messages) if message.get("role") != "system"),
             None,
@@ -424,7 +448,11 @@ def _update_evidence(
         shell_side_effects_unknown = True
         purpose = call.arguments.get("purpose", "work")
         if purpose == "verify":
-            verification = VerificationStatus.VERIFIED if result.ok else VerificationStatus.FAILED
+            verification = (
+                VerificationStatus.COMMAND_PASSED
+                if result.ok
+                else VerificationStatus.COMMAND_FAILED
+            )
         else:
             verification = VerificationStatus.REQUIRED
     return verification, shell_side_effects_unknown

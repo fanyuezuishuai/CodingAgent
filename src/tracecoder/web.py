@@ -8,6 +8,7 @@ from collections import deque
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from itertools import islice
 from pathlib import Path
 from typing import Literal, Protocol, TypeAlias, cast, runtime_checkable
@@ -29,6 +30,8 @@ from tracecoder.transaction import TransactionError, WorkspaceTransaction
 ApprovalCallback: TypeAlias = Callable[[list[str], Path], bool]
 TraceObserver: TypeAlias = Callable[[dict[str, object]], None]
 CancelCallback: TypeAlias = Callable[[], bool]
+ToolPolicy: TypeAlias = Literal["full", "read_only"]
+ProjectPhase: TypeAlias = Literal["planning", "awaiting_approval", "active"]
 
 
 class RunnableAgent(Protocol):
@@ -61,6 +64,7 @@ _STATIC_DIRECTORY = Path(__file__).with_name("web_static")
 _DEFAULT_COMPLETED_RUN_LIMIT = 50
 _MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 _INVALID_UPLOAD_NAME_CHARACTERS = frozenset('<>:"/\\|?*')
+_READ_ONLY_TOOLS = ("list_files", "search_text", "read_file")
 _WINDOWS_RESERVED_NAMES = {
     "CON",
     "PRN",
@@ -97,7 +101,12 @@ class _ManagedRun:
     task: str
     attachments: tuple[str, ...]
     prior_messages: tuple[Message, ...]
+    project_id: str | None = None
+    project_name: str | None = None
+    project_context: str | None = None
     scenario: ScenarioName = "general"
+    tool_policy: ToolPolicy = "full"
+    is_project_planning: bool = False
     status: str = "running"
     events: list[dict[str, object]] = field(default_factory=list)
     result: RunResult | None = None
@@ -116,7 +125,23 @@ class _ManagedRun:
 class _ManagedConversation:
     id: str
     title: str
+    project_id: str | None = None
     run_ids: list[str] = field(default_factory=list)
+    messages: tuple[Message, ...] = ()
+
+
+@dataclass(slots=True)
+class _ManagedProject:
+    id: str
+    name: str
+    goal: str
+    preferences: str
+    target_path: str
+    attachments: list[str]
+    created_at: str
+    updated_at: str
+    phase: ProjectPhase = "planning"
+    conversation_ids: list[str] = field(default_factory=list)
     messages: tuple[Message, ...] = ()
 
 
@@ -137,10 +162,60 @@ class RunManager:
         self._runs: dict[str, _ManagedRun] = {}
         self._conversations: dict[str, _ManagedConversation] = {}
         self._conversation_order: deque[str] = deque()
+        self._projects: dict[str, _ManagedProject] = {}
+        self._project_order: deque[str] = deque()
         self._completed_run_limit = completed_run_limit
         self._active_id: str | None = None
         self._latest_transaction_run_id: str | None = None
         self._lock = threading.Lock()
+
+    def create_project(
+        self,
+        *,
+        name: str,
+        goal: str,
+        preferences: str = "",
+        target_path: str = "",
+        attachments: tuple[str, ...] = (),
+    ) -> dict[str, object]:
+        """Create one in-memory project container for related conversations."""
+
+        timestamp = datetime.now(UTC).isoformat()
+        project = _ManagedProject(
+            id=uuid4().hex,
+            name=name.strip(),
+            goal=goal.strip(),
+            preferences=preferences.strip(),
+            target_path=target_path.strip(),
+            attachments=list(dict.fromkeys(attachments)),
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+        if not project.name or not project.goal:
+            raise ValueError("project name and goal must not be blank")
+        with self._lock:
+            self._projects[project.id] = project
+            self._project_order.append(project.id)
+            return self._project_snapshot_locked(project, include_conversations=True)
+
+    def project_history(self) -> list[dict[str, object]]:
+        """Return project summaries in most-recently-used order."""
+
+        with self._lock:
+            return [
+                self._project_summary_locked(self._projects[project_id])
+                for project_id in reversed(self._project_order)
+            ]
+
+    def project_snapshot(self, project_id: str) -> dict[str, object]:
+        """Return project metadata and all of its current conversations."""
+
+        with self._lock:
+            try:
+                project = self._projects[project_id]
+            except KeyError as exc:
+                raise RunNotFoundError(project_id) from exc
+            return self._project_snapshot_locked(project, include_conversations=True)
 
     def start(
         self,
@@ -148,7 +223,9 @@ class RunManager:
         *,
         attachments: tuple[str, ...] = (),
         conversation_id: str | None = None,
+        project_id: str | None = None,
         scenario: ScenarioName = "general",
+        tool_policy: ToolPolicy = "full",
     ) -> dict[str, object]:
         """Start one background run, rejecting overlapping workspace mutations."""
 
@@ -160,15 +237,44 @@ class RunManager:
                 active = self._runs[self._active_id]
                 if active.status in _ACTIVE_STATUSES:
                     raise RunConflictError("another agent run is already active")
-            self._accept_previous_transaction_locked()
             if conversation_id is None:
-                conversation = _ManagedConversation(uuid4().hex, _conversation_title(normalized_task))
-                self._conversations[conversation.id] = conversation
+                project = self._project_for_start_locked(project_id)
+                conversation = None
             else:
                 try:
                     conversation = self._conversations[conversation_id]
                 except KeyError as exc:
                     raise RunNotFoundError(conversation_id) from exc
+                if project_id is not None and project_id != conversation.project_id:
+                    raise RunConflictError("conversation does not belong to the requested project")
+                project = self._project_for_start_locked(conversation.project_id)
+
+            if project is not None and scenario != "general":
+                raise RunConflictError("project conversations do not use repair/generate presets")
+            is_project_planning = project is not None and project.phase == "planning"
+            if is_project_planning and tool_policy != "read_only":
+                raise RunConflictError("project planning must complete before full coding tools are enabled")
+            self._accept_previous_transaction_locked()
+            if project is not None and project.phase == "awaiting_approval" and tool_policy == "full":
+                project.phase = "active"
+                self._touch_project_locked(project)
+
+            if conversation is None:
+                conversation = _ManagedConversation(
+                    uuid4().hex,
+                    _conversation_title(normalized_task),
+                    project_id=project.id if project is not None else None,
+                )
+                self._conversations[conversation.id] = conversation
+                if project is not None:
+                    project.conversation_ids.append(conversation.id)
+
+            combined_attachments = tuple(
+                dict.fromkeys([*(project.attachments if project is not None else []), *attachments])
+            )
+            if project is not None:
+                project.attachments = list(combined_attachments)
+                self._touch_project_locked(project)
 
             if conversation.id in self._conversation_order:
                 self._conversation_order.remove(conversation.id)
@@ -176,19 +282,28 @@ class RunManager:
             while len(self._conversation_order) > self._completed_run_limit:
                 expired_conversation_id = self._conversation_order.popleft()
                 expired = self._conversations.pop(expired_conversation_id)
+                if expired.project_id is not None and expired.project_id in self._projects:
+                    project_conversations = self._projects[expired.project_id].conversation_ids
+                    if expired_conversation_id in project_conversations:
+                        project_conversations.remove(expired_conversation_id)
                 for expired_run_id in expired.run_ids:
                     self._runs.pop(expired_run_id, None)
 
             run_id = uuid4().hex
             managed = _ManagedRun(
-                run_id,
-                conversation.id,
-                conversation.title,
-                len(conversation.run_ids) + 1,
-                normalized_task,
-                attachments,
-                conversation.messages,
-                scenario,
+                id=run_id,
+                conversation_id=conversation.id,
+                conversation_title=conversation.title,
+                turn_index=len(conversation.run_ids) + 1,
+                task=normalized_task,
+                attachments=combined_attachments,
+                prior_messages=project.messages if project is not None else conversation.messages,
+                project_id=project.id if project is not None else None,
+                project_name=project.name if project is not None else None,
+                project_context=_project_context(project) if project is not None else None,
+                scenario=scenario,
+                tool_policy=tool_policy,
+                is_project_planning=is_project_planning,
             )
             self._runs[run_id] = managed
             conversation.run_ids.append(run_id)
@@ -238,31 +353,11 @@ class RunManager:
         """Return recent conversation summaries in most-recently-used order."""
 
         with self._lock:
-            entries: list[tuple[str, str, int, _ManagedRun]] = []
-            for conversation_id in reversed(self._conversation_order):
-                conversation = self._conversations[conversation_id]
-                if conversation.run_ids:
-                    entries.append(
-                        (
-                            conversation.id,
-                            conversation.title,
-                            len(conversation.run_ids),
-                            self._runs[conversation.run_ids[-1]],
-                        )
-                    )
-        summaries: list[dict[str, object]] = []
-        for conversation_id, title, turn_count, latest_run in entries:
-            with latest_run.lock:
-                status = latest_run.status
-            summaries.append(
-                {
-                    "id": conversation_id,
-                    "title": title,
-                    "status": status,
-                    "turn_count": turn_count,
-                }
-            )
-        return summaries
+            return [
+                self._conversation_summary_locked(self._conversations[conversation_id])
+                for conversation_id in reversed(self._conversation_order)
+                if self._conversations[conversation_id].run_ids
+            ]
 
     def conversation_snapshot(self, conversation_id: str) -> dict[str, object]:
         """Return all visible turns for one conversation."""
@@ -273,6 +368,8 @@ class RunManager:
             except KeyError as exc:
                 raise RunNotFoundError(conversation_id) from exc
             title = conversation.title
+            project_id = conversation.project_id
+            project_name = self._projects[project_id].name if project_id is not None else None
             managed_runs = [self._runs[run_id] for run_id in conversation.run_ids]
         turns: list[dict[str, object]] = []
         for managed in managed_runs:
@@ -281,9 +378,81 @@ class RunManager:
         return {
             "id": conversation_id,
             "title": title,
+            "project_id": project_id,
+            "project_name": project_name,
             "status": turns[-1]["status"] if turns else "empty",
             "turn_count": len(turns),
             "turns": turns,
+        }
+
+    def _project_for_start_locked(self, project_id: str | None) -> _ManagedProject | None:
+        if project_id is None:
+            return None
+        try:
+            return self._projects[project_id]
+        except KeyError as exc:
+            raise RunNotFoundError(project_id) from exc
+
+    def _touch_project_locked(self, project: _ManagedProject) -> None:
+        project.updated_at = datetime.now(UTC).isoformat()
+        if project.id in self._project_order:
+            self._project_order.remove(project.id)
+        self._project_order.append(project.id)
+
+    def _conversation_summary_locked(self, conversation: _ManagedConversation) -> dict[str, object]:
+        latest_run = self._runs[conversation.run_ids[-1]]
+        with latest_run.lock:
+            status = latest_run.status
+        project_name = (
+            self._projects[conversation.project_id].name
+            if conversation.project_id is not None and conversation.project_id in self._projects
+            else None
+        )
+        return {
+            "id": conversation.id,
+            "title": conversation.title,
+            "status": status,
+            "turn_count": len(conversation.run_ids),
+            "project_id": conversation.project_id,
+            "project_name": project_name,
+        }
+
+    def _project_snapshot_locked(
+        self,
+        project: _ManagedProject,
+        *,
+        include_conversations: bool,
+    ) -> dict[str, object]:
+        snapshot: dict[str, object] = {
+            "id": project.id,
+            "name": project.name,
+            "goal": project.goal,
+            "preferences": project.preferences,
+            "target_path": project.target_path,
+            "attachments": list(project.attachments),
+            "created_at": project.created_at,
+            "updated_at": project.updated_at,
+            "phase": project.phase,
+            "conversation_count": len(project.conversation_ids),
+        }
+        if include_conversations:
+            snapshot["conversations"] = [
+                self._conversation_summary_locked(self._conversations[conversation_id])
+                for conversation_id in reversed(project.conversation_ids)
+                if conversation_id in self._conversations
+            ]
+        return snapshot
+
+    @staticmethod
+    def _project_summary_locked(project: _ManagedProject) -> dict[str, object]:
+        goal = project.goal if len(project.goal) <= 240 else f"{project.goal[:237]}..."
+        return {
+            "id": project.id,
+            "name": project.name,
+            "goal": goal,
+            "updated_at": project.updated_at,
+            "phase": project.phase,
+            "conversation_count": len(project.conversation_ids),
         }
 
     def approve(self, run_id: str, approval_id: str, approved: bool) -> dict[str, object]:
@@ -414,6 +583,7 @@ class RunManager:
             managed.task,
             list(managed.attachments),
             managed.scenario,
+            project_context=managed.project_context,
         )
         conversation_messages: tuple[Message, ...] | None = None
         result: RunResult | None = None
@@ -422,6 +592,11 @@ class RunManager:
         error_type: str | None = None
         try:
             agent = self._agent_factory(approval, observer, managed.cancel_event.is_set, managed.id)
+            if managed.tool_policy == "read_only":
+                configure_tools = getattr(agent, "set_tool_allowlist", None)
+                if not callable(configure_tools):
+                    raise RuntimeError("agent does not support read-only tool policy")
+                configure_tools(_READ_ONLY_TOOLS)
             trace = getattr(agent, "trace", None)
             if isinstance(trace, TraceRecorder):
                 with managed.lock:
@@ -465,7 +640,18 @@ class RunManager:
                         self._append_event_locked(managed, "web_runner_error", {"error_type": error_type})
                 conversation = self._conversations.get(managed.conversation_id)
                 if conversation is not None and conversation.run_ids[-1] == managed.id:
-                    conversation.messages = tuple(dict(message) for message in conversation_messages)
+                    reusable_messages = tuple(dict(message) for message in conversation_messages)
+                    conversation.messages = reusable_messages
+                    if managed.project_id is not None and managed.project_id in self._projects:
+                        project = self._projects[managed.project_id]
+                        project.messages = reusable_messages
+                        if (
+                            managed.is_project_planning
+                            and result is not None
+                            and result.termination_reason is TerminationReason.COMPLETED
+                        ):
+                            project.phase = "awaiting_approval"
+                        self._touch_project_locked(project)
                 if self._active_id == managed.id:
                     self._active_id = None
 
@@ -588,10 +774,13 @@ class RunManager:
             "id": managed.id,
             "conversation_id": managed.conversation_id,
             "conversation_title": managed.conversation_title,
+            "project_id": managed.project_id,
+            "project_name": managed.project_name,
             "turn_index": managed.turn_index,
             "task": managed.task,
             "attachments": list(managed.attachments),
             "scenario": managed.scenario,
+            "tool_policy": managed.tool_policy,
             "status": managed.status,
             "events": [event.copy() for event in managed.events[after:]],
             "next_event_id": len(managed.events),
@@ -599,6 +788,12 @@ class RunManager:
             "result": result,
             "error": managed.error,
         }
+
+
+def _normalize_attachment_paths(value: list[str]) -> list[str]:
+    if any(not attachment.strip() for attachment in value):
+        raise ValueError("attachment paths must not be blank")
+    return list(dict.fromkeys(attachment.strip() for attachment in value))
 
 
 class StartRunRequest(BaseModel):
@@ -609,6 +804,8 @@ class StartRunRequest(BaseModel):
     attachments: list[str] = Field(default_factory=list, max_length=20)
     scenario: ScenarioName = "general"
     conversation_id: str | None = Field(default=None, min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$")
+    project_id: str | None = Field(default=None, min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$")
+    tool_policy: ToolPolicy = "full"
 
     @field_validator("task")
     @classmethod
@@ -620,9 +817,23 @@ class StartRunRequest(BaseModel):
     @field_validator("attachments")
     @classmethod
     def reject_blank_attachments(cls, value: list[str]) -> list[str]:
-        if any(not attachment.strip() for attachment in value):
-            raise ValueError("attachment paths must not be blank")
-        return list(dict.fromkeys(attachment.strip() for attachment in value))
+        return _normalize_attachment_paths(value)
+
+
+class CreateProjectRequest(BaseModel):
+    """Structured project metadata submitted from the local UI."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+    name: str = Field(min_length=1, max_length=120)
+    goal: str = Field(min_length=1, max_length=8_000)
+    preferences: str = Field(default="", max_length=4_000)
+    target_path: str = Field(default="", max_length=500)
+    attachments: list[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator("attachments")
+    @classmethod
+    def reject_blank_attachments(cls, value: list[str]) -> list[str]:
+        return _normalize_attachment_paths(value)
 
 
 class ApprovalRequest(BaseModel):
@@ -711,8 +922,12 @@ def _agent_task_with_attachments(
     task: str,
     attachments: list[str],
     scenario: ScenarioName = "general",
+    *,
+    project_context: str | None = None,
 ) -> str:
     enriched_task = apply_scenario(task, scenario)
+    if project_context is not None:
+        enriched_task = f"{project_context}\n\nCurrent project request:\n{enriched_task}"
     if not attachments:
         return enriched_task
     attachment_list = "\n".join(f"- {attachment}" for attachment in attachments)
@@ -722,12 +937,35 @@ def _agent_task_with_attachments(
 def _fallback_conversation_messages(managed: _ManagedRun, final_text: str) -> tuple[Message, ...]:
     """Build basic cross-turn context for a custom Agent without history support."""
 
-    task = _agent_task_with_attachments(managed.task, list(managed.attachments), managed.scenario)
+    task = _agent_task_with_attachments(
+        managed.task,
+        list(managed.attachments),
+        managed.scenario,
+        project_context=managed.project_context,
+    )
     return (
         *(dict(message) for message in managed.prior_messages),
         {"role": "user", "content": task},
         {"role": "assistant", "content": final_text},
     )
+
+
+def _project_context(project: _ManagedProject) -> str:
+    """Build stable project metadata without assuming repair or generation."""
+
+    lines = [
+        f'Project: "{project.name}"',
+        f"Project goal: {project.goal}",
+    ]
+    if project.preferences:
+        lines.append(f"Technical preferences: {project.preferences}")
+    if project.target_path:
+        lines.append(f"Preferred target path: {project.target_path}")
+    lines.append(
+        "Use the current workspace and uploaded files as authoritative. The project may contain existing code "
+        "or may start empty; inspect what exists and decide whether to modify or create code from the current request."
+    )
+    return "\n".join(lines)
 
 
 def _conversation_title(task: str) -> str:
@@ -870,12 +1108,14 @@ def create_app(
                 request.task,
                 attachments=tuple(attachments),
                 conversation_id=request.conversation_id,
+                project_id=request.project_id,
                 scenario=request.scenario,
+                tool_policy=request.tool_policy,
             )
         except (OSError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RunNotFoundError as exc:
-            raise HTTPException(status_code=404, detail="conversation not found") from exc
+            raise HTTPException(status_code=404, detail="conversation or project not found") from exc
         except RunConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -886,6 +1126,31 @@ def create_app(
     @app.get("/api/conversations")
     def conversation_history() -> dict[str, object]:
         return {"conversations": manager.conversation_history()}
+
+    @app.post("/api/projects", status_code=201)
+    def create_project(request: CreateProjectRequest) -> dict[str, object]:
+        try:
+            attachments = _resolve_attachments(canonical_workspace, request.attachments)
+            return manager.create_project(
+                name=request.name,
+                goal=request.goal,
+                preferences=request.preferences,
+                target_path=request.target_path,
+                attachments=tuple(attachments),
+            )
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/projects")
+    def project_history() -> dict[str, object]:
+        return {"projects": manager.project_history()}
+
+    @app.get("/api/projects/{project_id}")
+    def project_state(project_id: str) -> dict[str, object]:
+        try:
+            return manager.project_snapshot(project_id)
+        except RunNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
 
     @app.get("/api/conversations/{conversation_id}")
     def conversation_state(conversation_id: str) -> dict[str, object]:

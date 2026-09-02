@@ -62,6 +62,7 @@ def test_transaction_command_rolls_back_without_loading_model_configuration(
     transaction = WorkspaceTransaction(tmp_path, "cli-run")
     transaction.prepare_file(target)
     target.write_text("after\n", encoding="utf-8")
+    transaction.seal()
     proof = {
         "run_id": "cli-run",
         "transaction": {

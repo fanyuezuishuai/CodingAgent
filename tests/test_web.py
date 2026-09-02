@@ -59,8 +59,15 @@ def test_web_serves_ui_and_public_configuration(tmp_path: Path) -> None:
     assert 'id="history-list"' in page.text
     assert 'id="file-input"' in page.text
     assert 'id="task-input"' in page.text
-    assert 'id="repair-preset"' in page.text
-    assert 'id="generate-preset"' in page.text
+    assert 'id="projects-button"' in page.text
+    assert 'class="project-nav-icon"' in page.text
+    assert "📁" not in page.text
+    assert "□" not in page.text
+    assert 'id="projects-view"' in page.text
+    assert 'id="project-dialog"' in page.text
+    assert 'id="project-form"' in page.text
+    assert 'id="repair-preset"' not in page.text
+    assert 'id="generate-preset"' not in page.text
     assert 'id="proof-template"' in page.text
     assert 'id="workspace"' not in page.text
     assert 'id="provider"' not in page.text
@@ -83,7 +90,12 @@ def test_web_ui_assets_keep_process_collapsed_and_composer_docked(tmp_path: Path
         styles = client.get("/assets/styles.css")
 
     assert '<details class="process-card">' in page.text
-    assert page.text.index('id="model"') < page.text.index('id="new-chat-button"') < page.text.index("历史对话")
+    assert (
+        page.text.index('id="model"')
+        < page.text.index('id="new-chat-button"')
+        < page.text.index('id="projects-button"')
+        < page.text.index("历史对话")
+    )
     assert 'class="new-chat-button"' in page.text
     assert 'id="approval-description"' in page.text
     assert "查看完整命令" in page.text
@@ -95,13 +107,24 @@ def test_web_ui_assets_keep_process_collapsed_and_composer_docked(tmp_path: Path
     assert "/api/uploads?filename=" in script.text
     assert "/proof.md" in script.text
     assert "resolveTransaction" in script.text
-    assert "scenario: state.scenario" in script.text
+    assert 'request("/api/projects")' in script.text
+    assert "project_id: state.projectId" in script.text
+    assert "PROJECT_PLANNING_TASK" in script.text
+    assert "得到用户批准前不要开始编码" in script.text
+    assert 'toolPolicy: "read_only"' in script.text
+    assert "□" not in script.text
+    assert "appendSideBySideDiff" in script.text
+    assert "parseUnifiedDiff" in script.text
+    assert "proof-commands" not in page.text
+    assert 'class="diff-table"' not in page.text
     assert markdown.status_code == 200
     assert "escapeHtml" in markdown.text
     assert "javascript:" in markdown.text
     assert "grid-template-rows: auto minmax(0, 1fr) auto auto" in styles.text
     assert ".composer-dock" in styles.text
     assert ".empty-state[hidden]" in styles.text
+    assert ".diff-old.removed" in styles.text
+    assert ".diff-new.added" in styles.text
 
 
 def test_web_lists_run_history_newest_first(tmp_path: Path) -> None:
@@ -143,6 +166,43 @@ def test_web_lists_run_history_newest_first(tmp_path: Path) -> None:
     }
     assert first_snapshot.json()["task"] == "first task"
     assert first_snapshot.json()["result"]["final_text"] == "Finished first task."
+
+
+def test_web_read_only_run_configures_agent_tool_allowlist(tmp_path: Path) -> None:
+    observed_allowlists: list[tuple[str, ...]] = []
+
+    class PolicyAgent:
+        def set_tool_allowlist(self, names: tuple[str, ...]) -> None:
+            observed_allowlists.append(names)
+
+        def run(self, task: str) -> RunResult:
+            return RunResult(
+                final_text=f"Planned {task}.",
+                termination_reason=TerminationReason.COMPLETED,
+                verification_status=VerificationStatus.NOT_REQUIRED,
+                changed_files=(),
+                trace_path=str(tmp_path / "trace.jsonl"),
+                steps=1,
+            )
+
+    def factory(
+        _approval: Callable[[list[str], Path], bool],
+        _observer: Callable[[dict[str, object]], None],
+        _cancelled: Callable[[], bool],
+        _session_id: str,
+    ) -> RunnableAgent:
+        return cast(RunnableAgent, PolicyAgent())
+
+    app = create_app(tmp_path, _settings(), agent_factory=factory)
+    with TestClient(app) as client:
+        started = client.post(
+            "/api/runs",
+            json={"task": "plan only", "tool_policy": "read_only"},
+        ).json()
+        snapshot = _wait_for_status(client, started["id"], {"finished"})
+
+    assert snapshot["result"]["final_text"] == "Planned plan only."
+    assert observed_allowlists == [("list_files", "search_text", "read_file")]
 
 
 def test_web_conversation_supports_multiple_contextual_turns_until_new_chat(tmp_path: Path) -> None:
@@ -210,6 +270,8 @@ def test_web_conversation_supports_multiple_contextual_turns_until_new_chat(tmp_
             "title": "Remember the project codename Alpha.",
             "status": "finished",
             "turn_count": 2,
+            "project_id": None,
+            "project_name": None,
         }
     ]
     second_request = models[1].requests[0]
@@ -222,6 +284,207 @@ def test_web_conversation_supports_multiple_contextual_turns_until_new_chat(tmp_
     assert missing.status_code == 404
     assert separate["conversation_id"] != first["conversation_id"]
     assert len(updated_history.json()["conversations"]) == 2
+
+
+def test_project_groups_conversations_and_shares_context_across_them(tmp_path: Path) -> None:
+    replies = iter(
+        [
+            ModelReply(content="The implementation plan is ready for approval."),
+            ModelReply(content="The project codename is Cedar."),
+            ModelReply(content="The shared codename is Cedar."),
+            ModelReply(content="This ordinary chat has no project memory."),
+        ]
+    )
+    models: list[FakeModelClient] = []
+
+    def factory(
+        approval: Callable[[list[str], Path], bool],
+        observer: Callable[[dict[str, object]], None],
+        cancelled: Callable[[], bool],
+        session_id: str,
+    ) -> RunnableAgent:
+        model = FakeModelClient([next(replies)])
+        models.append(model)
+        return Agent(
+            model,
+            build_tool_registry(tmp_path, approval),
+            ContextManager(),
+            TraceRecorder(tmp_path, session_id=session_id, observer=observer),
+            cancelled=cancelled,
+        )
+
+    app = create_app(tmp_path, _settings(), agent_factory=factory)
+    with TestClient(app) as client:
+        uploaded = client.post(
+            "/api/uploads",
+            params={"filename": "starter.py"},
+            content=b"print('starter')\n",
+            headers={"content-type": "application/octet-stream"},
+        ).json()
+        created = client.post(
+            "/api/projects",
+            json={
+                "name": "Course assistant",
+                "goal": "Build and improve a small coursework assistant.",
+                "preferences": "Use Python and unittest.",
+                "target_path": "course_assistant",
+                "attachments": [uploaded["path"]],
+            },
+        )
+        assert created.status_code == 201
+        project = created.json()
+        assert project["phase"] == "planning"
+
+        blocked_before_plan = client.post(
+            "/api/runs",
+            json={"task": "Skip planning", "project_id": project["id"]},
+        )
+        planning = client.post(
+            "/api/runs",
+            json={
+                "task": "Prepare the implementation plan.",
+                "project_id": project["id"],
+                "tool_policy": "read_only",
+            },
+        ).json()
+        _wait_for_status(client, planning["id"], {"finished"})
+        assert client.get(f"/api/projects/{project['id']}").json()["phase"] == "awaiting_approval"
+
+        first = client.post(
+            "/api/runs",
+            json={
+                "task": "Approved. Remember that the codename is Cedar.",
+                "conversation_id": planning["conversation_id"],
+                "project_id": project["id"],
+            },
+        ).json()
+        _wait_for_status(client, first["id"], {"finished"})
+        second = client.post(
+            "/api/runs",
+            json={"task": "What codename did we choose?", "project_id": project["id"]},
+        ).json()
+        _wait_for_status(client, second["id"], {"finished"})
+        ordinary = client.post("/api/runs", json={"task": "What is this project's codename?"}).json()
+        _wait_for_status(client, ordinary["id"], {"finished"})
+
+        projects = client.get("/api/projects")
+        project_snapshot = client.get(f"/api/projects/{project['id']}")
+        conversations = client.get("/api/conversations")
+
+    assert blocked_before_plan.status_code == 409
+    assert first["project_id"] == second["project_id"] == project["id"]
+    assert first["conversation_id"] == planning["conversation_id"]
+    assert first["conversation_id"] != second["conversation_id"]
+    project_summary = projects.json()["projects"][0]
+    assert project_summary["conversation_count"] == 2
+    assert "attachments" not in project_summary
+    assert "preferences" not in project_summary
+    snapshot = project_snapshot.json()
+    assert snapshot["name"] == "Course assistant"
+    assert snapshot["phase"] == "active"
+    assert snapshot["attachments"] == [uploaded["path"]]
+    assert [item["id"] for item in snapshot["conversations"]] == [
+        second["conversation_id"],
+        first["conversation_id"],
+    ]
+    tagged = {
+        item["id"]: (item["project_id"], item["project_name"])
+        for item in conversations.json()["conversations"]
+    }
+    assert tagged[first["conversation_id"]] == (project["id"], "Course assistant")
+    assert tagged[ordinary["conversation_id"]] == (None, None)
+
+    first_request = models[1].requests[0]
+    assert "Build and improve a small coursework assistant." in str(first_request[-1]["content"])
+    assert "uploads/starter.py" in str(first_request[-1]["content"])
+    second_request = models[2].requests[0]
+    assert [message["role"] for message in second_request][-3:] == ["user", "assistant", "user"]
+    assert any("codename is Cedar" in str(message.get("content")) for message in second_request)
+    assert second_request[-2]["content"] == "The project codename is Cedar."
+    assert "What codename did we choose?" in str(second_request[-1]["content"])
+    ordinary_request = models[3].requests[0]
+    assert [message["role"] for message in ordinary_request] == ["system", "user"]
+    assert "Cedar" not in str(ordinary_request[1]["content"])
+
+
+def test_project_rejects_unknown_ids_and_cross_project_conversation_reuse(tmp_path: Path) -> None:
+    class ImmediateAgent:
+        def set_tool_allowlist(self, _names: tuple[str, ...]) -> None:
+            pass
+
+        def run(self, task: str) -> RunResult:
+            return RunResult(
+                final_text=f"Finished {task}.",
+                termination_reason=TerminationReason.COMPLETED,
+                verification_status=VerificationStatus.NOT_REQUIRED,
+                changed_files=(),
+                trace_path=str(tmp_path / "trace.jsonl"),
+                steps=1,
+            )
+
+    def factory(
+        _approval: Callable[[list[str], Path], bool],
+        _observer: Callable[[dict[str, object]], None],
+        _cancelled: Callable[[], bool],
+        _session_id: str,
+    ) -> RunnableAgent:
+        return ImmediateAgent()
+
+    app = create_app(tmp_path, _settings(), agent_factory=factory)
+    with TestClient(app) as client:
+        first_project = client.post(
+            "/api/projects",
+            json={"name": "First", "goal": "First goal"},
+        ).json()
+        second_project = client.post(
+            "/api/projects",
+            json={"name": "Second", "goal": "Second goal"},
+        ).json()
+        planning = client.post(
+            "/api/runs",
+            json={
+                "task": "Plan first",
+                "project_id": first_project["id"],
+                "tool_policy": "read_only",
+            },
+        ).json()
+        _wait_for_status(client, planning["id"], {"finished"})
+        first_run = client.post(
+            "/api/runs",
+            json={
+                "task": "Approve and start project work",
+                "conversation_id": planning["conversation_id"],
+                "project_id": first_project["id"],
+            },
+        ).json()
+        _wait_for_status(client, first_run["id"], {"finished"})
+
+        unknown = client.post(
+            "/api/runs",
+            json={"task": "Do not start", "project_id": "0" * 32},
+        )
+        unknown_project = client.get(f"/api/projects/{'0' * 32}")
+        invalid_attachment = client.post(
+            "/api/projects",
+            json={
+                "name": "Invalid attachment",
+                "goal": "Must not be created",
+                "attachments": ["uploads/missing.py"],
+            },
+        )
+        mismatch = client.post(
+            "/api/runs",
+            json={
+                "task": "Do not cross projects",
+                "project_id": second_project["id"],
+                "conversation_id": first_run["conversation_id"],
+            },
+        )
+
+    assert unknown.status_code == 404
+    assert unknown_project.status_code == 404
+    assert invalid_attachment.status_code == 400
+    assert mismatch.status_code == 409
 
 
 def test_web_uploads_files_into_workspace_without_overwriting(tmp_path: Path) -> None:
@@ -518,13 +781,14 @@ def test_web_exposes_proof_and_can_rollback_latest_file_transaction(tmp_path: Pa
             transaction = WorkspaceTransaction(tmp_path, self.session_id)
             transaction.prepare_file(target)
             target.write_text("broken = False\n", encoding="utf-8")
+            transaction.seal()
             proof = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "source": "tracecoder_runtime",
                 "run_id": self.session_id,
                 "task": task,
                 "termination_reason": "completed",
-                "verification_status": "verified",
+                "verification_status": "verify_command_passed",
                 "steps": 1,
                 "changed_files": ["course.py"],
                 "file_changes": transaction.file_changes(),
@@ -541,7 +805,7 @@ def test_web_exposes_proof_and_can_rollback_latest_file_transaction(tmp_path: Pa
             return RunResult(
                 final_text="Fixed.",
                 termination_reason=TerminationReason.COMPLETED,
-                verification_status=VerificationStatus.VERIFIED,
+                verification_status=VerificationStatus.COMMAND_PASSED,
                 changed_files=("course.py",),
                 trace_path=str(tmp_path / "trace.jsonl"),
                 steps=1,
@@ -593,6 +857,7 @@ def test_starting_next_turn_auto_accepts_previous_transaction(tmp_path: Path) ->
             transaction = WorkspaceTransaction(tmp_path, self.session_id)
             transaction.prepare_file(target)
             target.write_text("version = 2\n", encoding="utf-8")
+            transaction.seal()
             proof: dict[str, Any] = {
                 "run_id": self.session_id,
                 "task": task,

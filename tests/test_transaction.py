@@ -21,6 +21,7 @@ def test_rollback_restores_modified_files_and_removes_created_paths(tmp_path: Pa
     created = created_directory / "new.txt"
     transaction.prepare_file(created)
     created.write_text("new file\n", encoding="utf-8")
+    transaction.seal()
 
     outcome = transaction.rollback()
 
@@ -77,6 +78,7 @@ def test_rollback_refuses_partial_cleanup_when_command_left_untracked_artifact(t
     tracked.write_text("print('ok')\n", encoding="utf-8")
     untracked = generated / "command.cache"
     untracked.write_text("created by a command", encoding="utf-8")
+    transaction.seal()
 
     with pytest.raises(TransactionError, match="untracked command artifact"):
         transaction.rollback()
@@ -97,10 +99,31 @@ def test_newer_mutating_transaction_auto_accepts_previous_transaction(tmp_path: 
 
     second = WorkspaceTransaction(tmp_path, "second-run")
     second.prepare_file(second_file)
+    second_file.write_text("changed two", encoding="utf-8")
+    second.seal()
 
     assert WorkspaceTransaction.load(tmp_path, "first-run").state == "accepted"
     assert first_file.read_text(encoding="utf-8") == "changed one"
     assert second.rollback_available
+
+
+@pytest.mark.parametrize("created", [False, True])
+def test_rollback_refuses_to_overwrite_changes_made_after_run(tmp_path: Path, created: bool) -> None:
+    target = tmp_path / "value.txt"
+    if not created:
+        target.write_text("original", encoding="utf-8")
+    transaction = WorkspaceTransaction(tmp_path, f"conflict-{'created' if created else 'modified'}")
+    transaction.prepare_file(target)
+    target.write_text("agent result", encoding="utf-8")
+    transaction.seal()
+    transaction = WorkspaceTransaction.load(tmp_path, transaction.id)
+    target.write_text("newer user edit", encoding="utf-8")
+
+    with pytest.raises(TransactionError, match="changed after the run"):
+        transaction.rollback()
+
+    assert target.read_text(encoding="utf-8") == "newer user edit"
+    assert transaction.state == "pending"
 
 
 @pytest.mark.parametrize("transaction_id", ["../escape", "bad/name", "", "."])

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tracecoder.tools.filesystem import WorkspaceFileTools, WorkspacePolicy
+from tracecoder.tools.filesystem import WorkspaceFileTools, WorkspacePathError, WorkspacePolicy
 from tracecoder.transaction import WorkspaceTransaction
 
 
@@ -56,6 +56,19 @@ def test_workspace_dotenv_is_reserved_but_example_remains_readable(tools: Worksp
     assert search_result.data["matches"] == []
 
 
+@pytest.mark.parametrize(
+    "path",
+    [".env.", ".env ", ".env::$DATA", "src/CON.txt", "src/name?.py", "src/control\x01.py"],
+)
+def test_windows_unsafe_path_components_are_rejected(tmp_path: Path, path: str) -> None:
+    policy = WorkspacePolicy(tmp_path)
+
+    with pytest.raises(WorkspacePathError) as raised:
+        policy.resolve_for_write(path)
+
+    assert raised.value.code == "invalid_path"
+
+
 def test_read_search_write_and_replace(tools: WorkspaceFileTools, tmp_path: Path) -> None:
     read_result = tools.read_file("src/sample.py", start_line=2, max_lines=1)
     search_result = tools.search_text("alpha", "src", pattern="*.py")
@@ -94,6 +107,7 @@ def test_create_directory_then_write_file_with_transaction(tmp_path: Path) -> No
     assert directory_result.ok
     assert directory_result.metadata["changed_directory"] == "course_project"
     assert write_result.ok
+    transaction.seal()
     assert transaction.rollback_available
     transaction.rollback()
     assert not (tmp_path / "course_project").exists()

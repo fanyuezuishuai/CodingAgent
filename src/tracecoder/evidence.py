@@ -37,6 +37,7 @@ def command_evidence(
         "timed_out": metadata.get("timed_out", False),
         "stdout_truncated": metadata.get("stdout_truncated", False),
         "stderr_truncated": metadata.get("stderr_truncated", False),
+        "process_tree_terminated": metadata.get("process_tree_terminated", False),
     }
 
 
@@ -64,12 +65,17 @@ def build_proof(
     transaction_state = transaction.state if transaction is not None else "not_required"
     rollback_available = transaction.rollback_available if transaction is not None else False
     proof: dict[str, JSONValue] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source": "tracecoder_runtime",
         "run_id": run_id,
         "task": task,
         "termination_reason": termination_reason,
         "verification_status": verification_status,
+        "verification_basis": (
+            "runtime_observed_model_selected_command"
+            if verification_status in {"verify_command_passed", "verify_command_failed"}
+            else "runtime_state_only"
+        ),
         "steps": steps,
         "changed_files": cast(JSONValue, list(changed_files)),
         "file_changes": cast(JSONValue, file_changes),
@@ -114,8 +120,11 @@ def render_proof_markdown(proof: dict[str, JSONValue]) -> str:
         f"- Run ID: `{proof.get('run_id', '')}`",
         f"- Termination: `{proof.get('termination_reason', '')}`",
         f"- Verification: `{proof.get('verification_status', '')}`",
+        f"- Verification basis: `{proof.get('verification_basis', '')}`",
         f"- Steps: `{proof.get('steps', '')}`",
         f"- Trace: `{proof.get('trace_path', '')}`",
+        "",
+        "> A passing verification status means a model-selected command exited successfully; it does not prove the command was sufficient for the task.",
         "",
         "## Task",
         "",

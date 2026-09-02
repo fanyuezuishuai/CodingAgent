@@ -2,7 +2,10 @@
 
 import os
 import sys
+import time
 from pathlib import Path
+
+import pytest
 
 from tracecoder.tools.shell import RunCommandTool
 
@@ -33,6 +36,24 @@ def test_command_timeout_is_structured(tmp_path: Path) -> None:
     assert result.metadata["timed_out"] is True
 
 
+def test_command_timeout_terminates_descendant_processes(tmp_path: Path) -> None:
+    tool = RunCommandTool(tmp_path, approval=lambda _argv, _cwd: True, default_timeout_seconds=1)
+    child_code = "import time; from pathlib import Path; time.sleep(2); Path('survived.txt').write_text('bad')"
+    parent_code = (
+        "import subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        "time.sleep(30)"
+    )
+
+    result = tool([sys.executable, "-c", parent_code])
+    time.sleep(2.5)
+
+    assert result.error_code == "command_timeout"
+    if result.metadata["process_tree_terminated"] is not True:
+        pytest.skip("the host sandbox denied the operating-system process-tree terminator")
+    assert not (tmp_path / "survived.txt").exists()
+
+
 def test_child_environment_does_not_receive_api_key(tmp_path: Path, monkeypatch: object) -> None:
     os.environ["TRACECODER_API_KEY"] = "sentinel-secret"
     try:
@@ -59,4 +80,3 @@ def test_command_output_is_capped_while_process_runs(tmp_path: Path) -> None:
     assert result.ok
     assert len(result.data["stdout"].encode()) <= 128
     assert result.metadata["stdout_truncated"] is True
-

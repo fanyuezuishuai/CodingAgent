@@ -11,6 +11,7 @@ class FakeModelClient:
     def __init__(self, replies: Sequence[ModelReply]) -> None:
         self._replies = list(replies)
         self.requests: list[list[dict[str, object]]] = []
+        self.tool_requests: list[list[dict[str, object]]] = []
 
     def complete(
         self,
@@ -18,7 +19,7 @@ class FakeModelClient:
         tools: list[dict[str, object]],
     ) -> ModelReply:
         self.requests.append(messages)
+        self.tool_requests.append(tools)
         if not self._replies:
             raise AssertionError("Fake model has no reply left")
         return self._replies.pop(0)
-

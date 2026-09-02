@@ -15,6 +15,15 @@ MAX_FILE_BYTES = 1_000_000
 DEFAULT_MAX_ENTRIES = 200
 DEFAULT_MAX_RESULTS = 100
 RESERVED_TOP_LEVEL = {".env", ".git", ".tracecoder"}
+_WINDOWS_INVALID_NAME_CHARACTERS = frozenset('<>:"|?*')
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
 
 
 class WorkspacePathError(ValueError):
@@ -99,6 +108,8 @@ class WorkspacePolicy:
         parts = [part for part in normalized.split("/") if part not in {"", "."}]
         if ".." in parts:
             raise WorkspacePathError("path_outside_workspace", f"Parent traversal is not allowed: {raw_path}")
+        for part in parts:
+            _validate_portable_component(part, raw_path)
         if parts and parts[0].casefold() in RESERVED_TOP_LEVEL:
             raise WorkspacePathError("reserved_path", f"Runtime path is reserved: {parts[0]}")
         return Path(*parts) if parts else Path(".")
@@ -317,6 +328,17 @@ def _read_bounded(path: Path, limit: int) -> tuple[bytes, bool]:
     with path.open("rb") as handle:
         payload = handle.read(limit + 1)
     return payload[:limit], len(payload) > limit
+
+
+def _validate_portable_component(component: str, raw_path: str) -> None:
+    """Reject Win32 aliases and NTFS streams before resolving a model path."""
+
+    if (
+        component[-1] in {" ", "."}
+        or any(character in _WINDOWS_INVALID_NAME_CHARACTERS or ord(character) < 32 for character in component)
+        or component.split(".", maxsplit=1)[0].upper() in _WINDOWS_RESERVED_NAMES
+    ):
+        raise WorkspacePathError("invalid_path", f"Path contains an unsafe component: {raw_path}")
 
 
 def _atomic_write(path: Path, content: str) -> None:

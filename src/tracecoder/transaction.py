@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import os
 import tempfile
@@ -45,6 +46,8 @@ class WorkspaceTransaction:
         self._state = "not_required"
         self._files: dict[str, _FileRecord] = {}
         self._directories: list[str] = []
+        self._sealed = False
+        self._sealed_files: dict[str, str] = {}
         if self.manifest_path.is_file():
             self._load_manifest()
 
@@ -63,11 +66,13 @@ class WorkspaceTransaction:
 
     @property
     def rollback_available(self) -> bool:
-        return self._state == "pending" and bool(self._files or self._directories)
+        return self._state == "pending" and self._sealed and bool(self._files or self._directories)
 
     def prepare_file(self, target: Path) -> None:
         """Persist the original bytes or record that a file did not exist."""
 
+        if self._sealed:
+            raise TransactionError("transaction is already sealed")
         relative, safe_target = self._safe_target(target)
         if relative in self._files:
             return
@@ -102,6 +107,8 @@ class WorkspaceTransaction:
     def prepare_directory(self, target: Path) -> None:
         """Record one directory that the file tool is about to create."""
 
+        if self._sealed:
+            raise TransactionError("transaction is already sealed")
         relative, safe_target = self._safe_target(target)
         if safe_target.exists() or safe_target.is_symlink():
             raise TransactionError(f"directory already exists: {relative}")
@@ -118,6 +125,26 @@ class WorkspaceTransaction:
             if not was_pending:
                 self._state = "not_required"
                 self._clear_latest()
+            raise
+
+    def seal(self) -> None:
+        """Record the completed run state used to detect later external edits."""
+
+        if self._state == "not_required":
+            return
+        if self._state != "pending":
+            raise TransactionError(f"transaction is already {self._state}")
+        markers = {
+            relative: self._current_file_marker(self._manifest_target(relative))
+            for relative in self._files
+        }
+        self._sealed_files = markers
+        self._sealed = True
+        try:
+            self._save_manifest()
+        except OSError:
+            self._sealed = False
+            self._sealed_files = {}
             raise
 
     def file_changes(self) -> list[dict[str, object]]:
@@ -177,6 +204,8 @@ class WorkspaceTransaction:
             raise TransactionError("transaction was already accepted")
         if self._state == "not_required":
             raise TransactionError("transaction has no file-tool mutations")
+        if not self._sealed:
+            raise TransactionError("transaction was not sealed at the end of its run")
         latest = self._read_latest()
         if latest is not None and latest != self.id:
             raise TransactionError("only the latest pending transaction can be rolled back")
@@ -185,6 +214,8 @@ class WorkspaceTransaction:
         backups: dict[str, bytes] = {}
         for record in self._files.values():
             target = self._manifest_target(record.path)
+            if self._current_file_marker(target) != self._sealed_files.get(record.path):
+                raise TransactionError(f"transaction target changed after the run: {record.path}")
             if not target.parent.is_dir():
                 raise TransactionError(f"rollback parent is unavailable: {record.path}")
             if record.kind == "modified":
@@ -290,6 +321,21 @@ class WorkspaceTransaction:
             raise TransactionError(f"transaction backup is too large: {record.path}")
         return payload
 
+    @staticmethod
+    def _current_file_marker(target: Path) -> str:
+        if not target.exists() and not target.is_symlink():
+            return "missing"
+        if target.is_symlink() or not target.is_file():
+            return "other"
+        digest = hashlib.sha256()
+        try:
+            with target.open("rb") as handle:
+                while chunk := handle.read(64 * 1024):
+                    digest.update(chunk)
+        except OSError as exc:
+            raise TransactionError(f"transaction target is unreadable: {target.name}") from exc
+        return f"file:{digest.hexdigest()}"
+
     def _validate_created_directory_contents(self) -> None:
         """Refuse partial rollback when commands left untracked generated artifacts."""
 
@@ -324,6 +370,8 @@ class WorkspaceTransaction:
             "version": 1,
             "transaction_id": self.id,
             "state": self._state,
+            "sealed": self._sealed,
+            "sealed_files": self._sealed_files,
             "files": [
                 {"path": item.path, "kind": item.kind, "backup": item.backup}
                 for item in self._files.values()
@@ -345,7 +393,14 @@ class WorkspaceTransaction:
                 raise ValueError
             files = payload["files"]
             directories = payload["directories"]
-            if not isinstance(files, list) or not isinstance(directories, list):
+            sealed = payload.get("sealed", False)
+            sealed_files = payload.get("sealed_files", {})
+            if (
+                not isinstance(files, list)
+                or not isinstance(directories, list)
+                or not isinstance(sealed, bool)
+                or not isinstance(sealed_files, dict)
+            ):
                 raise ValueError
             loaded_files: dict[str, _FileRecord] = {}
             for item in files:
@@ -366,11 +421,25 @@ class WorkspaceTransaction:
             loaded_directories = [str(item) for item in directories]
             for relative in loaded_directories:
                 self._manifest_target(relative)
+            loaded_sealed_files: dict[str, str] = {}
+            for relative, marker in sealed_files.items():
+                if not isinstance(relative, str) or not isinstance(marker, str):
+                    raise ValueError
+                self._manifest_target(relative)
+                if relative not in loaded_files or not _valid_file_marker(marker):
+                    raise ValueError
+                loaded_sealed_files[relative] = marker
+            if sealed and set(loaded_sealed_files) != set(loaded_files):
+                raise ValueError
+            if not sealed and loaded_sealed_files:
+                raise ValueError
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise TransactionError(f"invalid transaction manifest: {self.id}") from exc
         self._state = str(state)
         self._files = loaded_files
         self._directories = loaded_directories
+        self._sealed = sealed
+        self._sealed_files = loaded_sealed_files
 
     def _remove_backups(self) -> None:
         backups = self.directory / "backups"
@@ -398,3 +467,10 @@ def _atomic_write_bytes(path: Path, content: bytes) -> None:
 
 def _normalize_newlines(value: str) -> str:
     return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _valid_file_marker(value: str) -> bool:
+    if value in {"missing", "other"}:
+        return True
+    digest = value.removeprefix("file:")
+    return value.startswith("file:") and len(digest) == 64 and all(character in "0123456789abcdef" for character in digest)

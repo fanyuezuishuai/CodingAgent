@@ -9,5 +9,11 @@ __pycache__/
 *.egg-info/
 build/
 dist/
-代码介绍.md
 docs/
+uploads/
+*.exe
+/CourseManagementSystem.java
+/binary_tree.cpp
+/dijkstra.cpp
+/fibonacci.cpp
+/代码介绍.*

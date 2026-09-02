@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 
 from tracecoder.domain import JSONValue, ToolResult
@@ -33,9 +33,10 @@ class ToolRegistry:
             raise ValueError(f"Tool already registered: {definition.name}")
         self._tools[definition.name] = definition
 
-    def schemas_for_model(self) -> list[dict[str, object]]:
+    def schemas_for_model(self, allowed_names: Collection[str] | None = None) -> list[dict[str, object]]:
         """Return OpenAI-compatible function-tool definitions."""
 
+        allowed = frozenset(allowed_names) if allowed_names is not None else None
         return [
             {
                 "type": "function",
@@ -46,11 +47,20 @@ class ToolRegistry:
                 },
             }
             for definition in self._tools.values()
+            if allowed is None or definition.name in allowed
         ]
 
-    def execute(self, name: str, arguments: Mapping[str, JSONValue]) -> ToolResult:
+    def execute(
+        self,
+        name: str,
+        arguments: Mapping[str, JSONValue],
+        *,
+        allowed_names: Collection[str] | None = None,
+    ) -> ToolResult:
         """Validate and execute a tool without leaking exceptions into the loop."""
 
+        if allowed_names is not None and name not in allowed_names:
+            return ToolResult.failure("tool_not_allowed", f"Tool is disabled for this run: {name}")
         definition = self._tools.get(name)
         if definition is None:
             return ToolResult.failure("unknown_tool", f"Unknown tool: {name}")
@@ -126,4 +136,3 @@ def _validate_value(name: str, value: JSONValue, schema: Mapping[str, object]) -
                 if error:
                     return error
     return None
-

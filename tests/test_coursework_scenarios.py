@@ -85,7 +85,7 @@ def test_coursework_repair_scenario_fixes_verifies_proves_and_rolls_back(tmp_pat
 
     result = agent.run(apply_scenario("Fix the addition function", "repair"))
 
-    assert result.verification_status is VerificationStatus.VERIFIED
+    assert result.verification_status is VerificationStatus.COMMAND_PASSED
     assert result.successful
     assert result.proof is not None
     assert result.proof["file_changes"][0]["path"] == "course_project/calculator.py"
@@ -152,7 +152,7 @@ def test_small_project_generation_creates_runnable_tested_project_and_rolls_back
     )
 
     assert result.successful
-    assert result.verification_status is VerificationStatus.VERIFIED
+    assert result.verification_status is VerificationStatus.COMMAND_PASSED
     assert len(result.changed_files) == 6
     assert all((tmp_path / path).is_file() for path in files)
     assert result.proof is not None

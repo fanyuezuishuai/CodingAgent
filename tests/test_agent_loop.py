@@ -67,13 +67,41 @@ def test_fake_model_can_edit_verify_and_complete(tmp_path: Path) -> None:
     result = agent.run("Change the value to 2")
 
     assert result.termination_reason is TerminationReason.COMPLETED
-    assert result.verification_status is VerificationStatus.VERIFIED
+    assert result.verification_status is VerificationStatus.COMMAND_PASSED
     assert result.changed_files == ("app.py",)
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "value = 2\n"
     assert any(message.get("tool_call_id") == "verify" for message in model.requests[-1])
     events = read_trace(trace.path)
     assert events[-1]["event_type"] == "run_finished"
     assert events[-1]["payload"]["reason"] == "completed"
+
+
+def test_read_only_tool_policy_hides_and_blocks_mutating_tools(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    replies = [
+        ModelReply(
+            tool_calls=(
+                ToolCall(
+                    "write",
+                    "write_file",
+                    {"path": "app.py", "content": "value = 2\n", "overwrite": True},
+                ),
+            )
+        ),
+        ModelReply(content="I kept the planning run read-only."),
+    ]
+    agent, model, _trace = _agent(tmp_path, replies)
+    agent.set_tool_allowlist(("list_files", "search_text", "read_file"))
+
+    result = agent.run("Plan the change without modifying files")
+
+    visible_names = {tool["function"]["name"] for tool in model.tool_requests[0]}
+    assert visible_names == {"list_files", "search_text", "read_file"}
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+    tool_messages = [message for message in model.requests[1] if message.get("role") == "tool"]
+    assert "tool_not_allowed" in str(tool_messages[0]["content"])
+    assert result.changed_files == ()
 
 
 def test_proof_mode_records_diff_command_evidence_and_local_exports(tmp_path: Path) -> None:
@@ -115,13 +143,16 @@ def test_proof_mode_records_diff_command_evidence_and_local_exports(tmp_path: Pa
     assert "+value = 2" in result.proof["file_changes"][0]["diff"]
     assert result.proof["commands"][0]["purpose"] == "verify"
     assert result.proof["commands"][0]["exit_code"] == 0
+    assert result.proof["verification_status"] == "verify_command_passed"
+    assert result.proof["verification_basis"] == "runtime_observed_model_selected_command"
     assert result.proof["transaction"]["rollback_available"] is True
     assert Path(result.proof_json_path).is_file()
     assert Path(result.proof_markdown_path).is_file()
     markdown = Path(result.proof_markdown_path).read_text(encoding="utf-8")
     assert "# TraceCoder Proof" in markdown
     assert "#### stdout" in markdown
-    assert "verified" in markdown
+    assert "verify_command_passed" in markdown
+    assert "model-selected" in markdown
 
 
 def test_agent_carries_structured_conversation_messages_into_the_next_turn(tmp_path: Path) -> None:

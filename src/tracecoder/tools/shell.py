@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -100,6 +101,12 @@ class RunCommandTool:
                 cwd=self.workspace,
                 env=_minimal_child_environment(self.environ),
                 shell=False,
+                start_new_session=os.name != "nt",
+                creationflags=(
+                    getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                    if os.name == "nt"
+                    else 0
+                ),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -118,11 +125,12 @@ class RunCommandTool:
         stdout_thread.start()
         stderr_thread.start()
         timed_out = False
+        process_tree_terminated = False
         try:
             exit_code = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
-            process.kill()
+            process_tree_terminated = _terminate_process_tree(process, self.environ)
             exit_code = process.wait()
         stdout_thread.join(timeout=2)
         stderr_thread.join(timeout=2)
@@ -148,11 +156,12 @@ class RunCommandTool:
             "stdout_truncated": stdout_capture.truncated,
             "stderr_truncated": stderr_capture.truncated,
             "shell_side_effects_unknown": True,
+            "process_tree_terminated": process_tree_terminated,
         }
         if timed_out:
             return ToolResult.failure(
                 "command_timeout",
-                f"Command exceeded {timeout} seconds; the direct process was terminated",
+                f"Command exceeded {timeout} seconds; process-tree termination was attempted",
                 data=data,
                 metadata=metadata,
             )
@@ -168,3 +177,40 @@ class RunCommandTool:
 
 def _minimal_child_environment(environ: Mapping[str, str]) -> dict[str, str]:
     return {name: value for name, value in environ.items() if name.upper() in _CHILD_ENV_ALLOWLIST}
+
+
+def _terminate_process_tree(process: subprocess.Popen[bytes], environ: Mapping[str, str]) -> bool:
+    """Best-effort termination for the approved command and descendants."""
+
+    if os.name == "nt":
+        system_root = environ.get("SYSTEMROOT") or environ.get("WINDIR") or r"C:\Windows"
+        taskkill = Path(system_root) / "System32" / "taskkill.exe"
+        try:
+            completed = subprocess.run(
+                [str(taskkill), "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+            if completed.returncode == 0:
+                return True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        kill_process_group = getattr(os, "killpg", None)
+        kill_signal = getattr(signal, "SIGKILL", 9)
+        try:
+            if not callable(kill_process_group):
+                raise OSError("process-group termination is unavailable")
+            kill_process_group(process.pid, kill_signal)
+            return True
+        except OSError:
+            pass
+
+    try:
+        process.kill()
+    except OSError:
+        return process.poll() is not None
+    return False

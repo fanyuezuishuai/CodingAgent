@@ -74,8 +74,8 @@ class VerificationStatus(StrEnum):
 
     NOT_REQUIRED = "not_required"
     REQUIRED = "required"
-    VERIFIED = "verified"
-    FAILED = "failed"
+    COMMAND_PASSED = "verify_command_passed"
+    COMMAND_FAILED = "verify_command_failed"
 
 
 class TerminationReason(StrEnum):
@@ -108,9 +108,9 @@ class RunResult:
 
     @property
     def successful(self) -> bool:
-        """Whether the loop completed with adequate verification evidence."""
+        """Whether the loop completed without pending or failed runtime checks."""
 
         return self.termination_reason is TerminationReason.COMPLETED and self.verification_status in {
             VerificationStatus.NOT_REQUIRED,
-            VerificationStatus.VERIFIED,
+            VerificationStatus.COMMAND_PASSED,
         }
